@@ -51,6 +51,18 @@ def analyze(csv_text, mode='full', max_population_change_pct=25):
             row_errors.append('invalid work_email')
         if data['manager_employee_id'] == eid and eid:
             row_errors.append('employee cannot manage self')
+        for date_field in ('hire_date', 'termination_date'):
+            if data[date_field]:
+                try:
+                    datetime.fromisoformat(data[date_field])
+                except ValueError:
+                    row_errors.append(f'invalid {date_field}')
+        if data['hire_date'] and data['termination_date'] and not row_errors:
+            try:
+                if datetime.fromisoformat(data['termination_date']) < datetime.fromisoformat(data['hire_date']):
+                    row_errors.append('termination_date precedes hire_date')
+            except ValueError:
+                pass
         if row_errors:
             errors.append({'row':idx,'employee_id':eid,'errors':row_errors})
         else:
@@ -61,6 +73,7 @@ def analyze(csv_text, mode='full', max_population_change_pct=25):
         current_active = sum(1 for r in current.values() if r['employment_status']=='active')
     creates, updates, unchanged = [], [], []
     incoming_ids = set()
+    warnings = []
     for item in normalized:
         incoming_ids.add(item['employee_id'])
         old = current.get(item['employee_id'])
@@ -70,6 +83,11 @@ def analyze(csv_text, mode='full', max_population_change_pct=25):
             changed = {k:{'from':old.get(k) or '', 'to':item.get(k) or ''} for k in EMPLOYEE_FIELDS if str(old.get(k) or '') != str(item.get(k) or '')}
             if changed: updates.append({'employee_id':item['employee_id'],'changes':changed})
             else: unchanged.append(item['employee_id'])
+    known_ids = set(current) | incoming_ids
+    for item in normalized:
+        manager = item.get('manager_employee_id')
+        if manager and manager not in known_ids:
+            warnings.append(f"row for {item['employee_id']} references unknown manager {manager}")
     suspends = []
     if mode == 'full':
         suspends = [eid for eid,r in current.items() if r['employment_status']=='active' and eid not in incoming_ids]
@@ -86,13 +104,17 @@ def analyze(csv_text, mode='full', max_population_change_pct=25):
         'creates': creates, 'updates': updates, 'unchanged': unchanged, 'suspends': suspends,
         'current_active': current_active, 'incoming_active': incoming_active,
         'population_change_pct': round(change_pct,2), 'blockers': blockers,
+        'warnings': warnings,
         'can_apply': not blockers, 'normalized': normalized
     }
 
-def _derived_roles(employee, all_rows):
+def _derived_roles(employee, all_rows, manager_ids=None):
     roles = {('learner','self')}
     eid = employee['employee_id']
-    if any(r.get('manager_employee_id') == eid and r.get('employment_status') == 'active' for r in all_rows):
+    managers = manager_ids if manager_ids is not None else {
+        r.get('manager_employee_id') for r in all_rows
+    }
+    if eid in managers:
         roles.add(('manager', f'manager:{eid}'))
     job = (employee.get('job_code') or '').upper()
     if job.startswith('TRN') or job.startswith('INSTR'):
@@ -110,6 +132,15 @@ def apply(csv_text, filename='employee_extract.csv', mode='full', actor='integra
         cur = conn.execute("INSERT INTO import_jobs(filename,checksum,mode,status,row_count,accepted_count,rejected_count,create_count,update_count,suspend_count,summary_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (filename,analysis['checksum'],mode,'applying',analysis['row_count'],analysis['accepted_count'],analysis['rejected_count'],len(analysis['creates']),len(analysis['updates']),len(analysis['suspends']),json.dumps({k:v for k,v in analysis.items() if k!='normalized'})))
         job_id = cur.lastrowid
+        manager_ids = {
+            row['manager_employee_id'] for row in conn.execute(
+                "SELECT manager_employee_id FROM employees WHERE manager_employee_id IS NOT NULL AND employment_status='active'"
+            ).fetchall()
+        }
+        manager_ids |= {
+            emp['manager_employee_id'] for emp in analysis['normalized']
+            if emp.get('manager_employee_id')
+        }
         for emp in analysis['normalized']:
             existing = conn.execute("SELECT employee_id FROM employees WHERE employee_id=?", (emp['employee_id'],)).fetchone()
             if existing:
@@ -122,7 +153,7 @@ def apply(csv_text, filename='employee_extract.csv', mode='full', actor='integra
                 conn.execute(f"INSERT INTO employees({cols}) VALUES({marks})", [emp[f] for f in EMPLOYEE_FIELDS])
                 event = 'EmployeeCreated'
             conn.execute("DELETE FROM employee_roles WHERE employee_id=? AND assigned_by='hris'", (emp['employee_id'],))
-            for role, scope in _derived_roles(emp, analysis['normalized']):
+            for role, scope in _derived_roles(emp, analysis['normalized'], manager_ids):
                 conn.execute("INSERT OR IGNORE INTO employee_roles(employee_id,role,scope,assigned_by) VALUES(?,?,?,'hris')", (emp['employee_id'],role,scope))
             record(event, actor, 'employee', emp['employee_id'], {'import_job_id':job_id}, conn=conn)
         for eid in analysis['suspends']:

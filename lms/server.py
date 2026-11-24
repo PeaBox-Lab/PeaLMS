@@ -1,195 +1,364 @@
+"""HTTP transport for the LMS.
+
+Kept intentionally thin: parse the request, apply transport controls (rate
+limiting, security headers, request ids), delegate to :mod:`lms.api`, write the
+response. Business rules live in services.
+"""
+
+from __future__ import annotations
+
 import argparse
-import base64
-import hashlib
-import hmac
 import json
 import mimetypes
-import os
-import secrets
+import re
+import sys
 import time
 import traceback
-from http import HTTPStatus
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
+from . import api, media
+from .auth import issue_token as issue_demo_token
+from .auth import verify_token
+from .config import get_settings
 from .db import init_db
+from .security import (
+    RateLimiter,
+    configure_logging,
+    log_access,
+    new_request_id,
+    security_headers,
+)
 from .seed import seed
-from . import services
-from . import hris
 
-ROOT = Path(__file__).resolve().parents[1]
-STATIC = Path(__file__).resolve().parent / 'static'
-DEMO_MODE = os.environ.get('LMS_DEMO_MODE','false').lower() in ('1','true','yes')
-ALLOW_REMOTE_DEMO = os.environ.get('LMS_ALLOW_REMOTE_DEMO','false').lower() in ('1','true','yes')
-SESSION_SECRET = os.environ.get('LMS_SESSION_SECRET') or secrets.token_hex(32)
+__all__ = ["Handler", "LmsServer", "create_server", "issue_demo_token", "main", "verify_token"]
 
-ROLE_PERMISSIONS = {
-  'learner': {'read','complete_self'},
-  'manager': {'read','complete_self'},
-  'instructor': {'read','complete_any'},
-  'auditor': {'read','audit'},
-  'learning_admin': {'read','manage_learning','manage_people','hris','audit','complete_any'},
-  'platform_admin': {'read','manage_learning','manage_people','hris','audit','complete_any'}
+STATIC_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
 }
 
-def issue_demo_token(role, actor):
-    payload = json.dumps({'role':role,'actor':actor,'exp':int(time.time())+3600}, separators=(',',':')).encode()
-    encoded = base64.urlsafe_b64encode(payload).rstrip(b'=')
-    signature = hmac.new(SESSION_SECRET.encode(), encoded, hashlib.sha256).hexdigest().encode()
-    return (encoded + b'.' + signature).decode()
-
-def verify_token(token):
-    try:
-        encoded, signature = token.encode().split(b'.',1)
-        expected = hmac.new(SESSION_SECRET.encode(), encoded, hashlib.sha256).hexdigest().encode()
-        if not hmac.compare_digest(signature, expected): return None
-        payload = json.loads(base64.urlsafe_b64decode(encoded + b'=' * (-len(encoded)%4)))
-        if int(payload.get('exp',0)) < int(time.time()): return None
-        if payload.get('role') not in ROLE_PERMISSIONS: return None
-        return payload
-    except Exception: return None
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'CorporateLMS/0.1.0'
+    server_version = "CorporateLMS"
+    protocol_version = "HTTP/1.1"
 
-    def log_message(self, fmt, *args):
-        print(f"{self.address_string()} - {fmt % args}")
-
-    @property
-    def identity(self):
-        auth = self.headers.get('Authorization','')
-        return verify_token(auth[7:]) if auth.startswith('Bearer ') else None
-    @property
-    def role(self): return (self.identity or {}).get('role')
-    @property
-    def actor(self): return (self.identity or {}).get('actor')
-
-    def require(self, permission):
-        if not self.identity:
-            self.json({'error':'unauthorized','message':'A valid session is required'}, 401)
-            return False
-        if permission not in ROLE_PERMISSIONS.get(self.role,set()):
-            self.json({'error':'forbidden','message':f'Role {self.role} lacks {permission}'}, 403)
-            return False
-        return True
-
-    def json(self, payload, status=200):
-        raw = json.dumps(payload, default=str).encode('utf-8')
+    # -- response helpers -------------------------------------------------
+    def _write(self, status, payload, content_type="application/json; charset=utf-8",
+               extra_headers=None, request_id=""):
+        if isinstance(payload, (dict, list)):
+            raw = json.dumps(payload, default=str).encode("utf-8")
+        elif isinstance(payload, str):
+            raw = payload.encode("utf-8")
+        else:
+            raw = payload
         self.send_response(status)
-        self.send_header('Content-Type','application/json; charset=utf-8')
-        self.send_header('Content-Length',str(len(raw)))
-        self.send_header('X-Content-Type-Options','nosniff')
-        self.send_header('Cache-Control','no-store')
-        self.end_headers(); self.wfile.write(raw)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        if request_id:
+            self.send_header("X-Request-ID", request_id)
+        for name, value in security_headers(tls=self._is_tls()).items():
+            self.send_header(name, value)
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(raw)
 
-    def body(self):
-        length = int(self.headers.get('Content-Length','0'))
-        if length < 0 or length > 5_000_000: raise ValueError('Invalid request body length')
-        raw = self.rfile.read(length) if length else b'{}'
-        return json.loads(raw.decode('utf-8'))
+    def _is_tls(self):
+        return self.headers.get("X-Forwarded-Proto", "").lower() == "https"
 
-    def static(self, path):
-        rel = 'index.html' if path in ('/','') else path.lstrip('/')
-        file = (STATIC / rel).resolve()
-        if STATIC.resolve() not in file.parents or not file.is_file():
-            return self.json({'error':'not_found'},404)
-        data = file.read_bytes(); mime = mimetypes.guess_type(str(file))[0] or 'application/octet-stream'
-        self.send_response(200); self.send_header('Content-Type',mime); self.send_header('Content-Length',str(len(data)))
-        self.send_header('X-Content-Type-Options','nosniff'); self.end_headers(); self.wfile.write(data)
+    def _json_error(self, status, error, message, request_id="", extra_headers=None):
+        self._write(status, {"error": error, "message": message},
+                    extra_headers=extra_headers, request_id=request_id)
+
+    # -- request helpers --------------------------------------------------
+    def _identity(self):
+        header = self.headers.get("Authorization", "")
+        if header.startswith("Bearer "):
+            return verify_token(header[7:].strip())
+        return None
+
+    def _body(self):
+        settings = get_settings()
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise ValueError("Invalid Content-Length header")
+        if length < 0 or length > settings.max_body_bytes:
+            raise OverflowError("Request body exceeds the configured limit")
+        if not length:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Request body must be valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("Request body must be a JSON object")
+        return parsed
+
+    def _raw_body(self, limit):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise ValueError("Invalid Content-Length header")
+        if length <= 0:
+            raise ValueError("An upload body is required")
+        if length > limit:
+            raise OverflowError(f"Upload exceeds the {limit} byte limit")
+        return self.rfile.read(length)
+
+    def _serve_media(self, path, query, request_id):
+        """Serve a signed media object, honouring HTTP range requests."""
+        match = re.match(r"^/media/(\d+)$", path)
+        if not match:
+            self._json_error(404, "not_found", "Resource not found", request_id)
+            return 404
+        media_id = int(match.group(1))
+        if not media.verify(media_id, query.get("exp"), query.get("sig")):
+            self._json_error(404, "not_found", "Media link is invalid or expired", request_id)
+            return 404
+        item = media.get(media_id)
+        if not item:
+            self._json_error(404, "not_found", "Resource not found", request_id)
+            return 404
+        try:
+            target = media.file_path(item)
+        except ValueError:
+            self._json_error(404, "not_found", "Resource not found", request_id)
+            return 404
+        if not target.is_file():
+            self._json_error(404, "not_found", "Resource not found", request_id)
+            return 404
+
+        size = target.stat().st_size
+        start, end, status = 0, max(0, size - 1), 200
+        range_header = (self.headers.get("Range") or "").strip()
+        if range_header.startswith("bytes=") and size:
+            spec = range_header[6:].split(",")[0]
+            first, _, last = spec.partition("-")
+            try:
+                if first == "":
+                    start = max(0, size - int(last))
+                    end = size - 1
+                else:
+                    start = int(first)
+                    end = int(last) if last else size - 1
+            except ValueError:
+                start, end = 0, size - 1
+            start = max(0, min(start, size - 1))
+            end = max(start, min(end, size - 1))
+            status = 206
+
+        length = max(0, end - start + 1) if size else 0
+        headers = {"Cache-Control": "private, max-age=300", "Accept-Ranges": "bytes"}
+        if status == 206:
+            headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+
+        self.send_response(status)
+        self.send_header("Content-Type", item["content_type"])
+        self.send_header("Content-Length", str(length))
+        if request_id:
+            self.send_header("X-Request-ID", request_id)
+        for name, value in security_headers(tls=self._is_tls()).items():
+            self.send_header(name, value)
+        for name, value in headers.items():
+            self.send_header(name, value)
+        self.end_headers()
+        if self.command != "HEAD" and length:
+            with open(target, "rb") as handle:
+                handle.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = handle.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        return status
+
+    def _serve_static(self, path, request_id):
+        settings = get_settings()
+        rel = "index.html" if path in ("/", "") else path.lstrip("/")
+        root = Path(settings.static_dir).resolve()
+        target = (root / rel).resolve()
+        if root != target and root not in target.parents:
+            self._json_error(404, "not_found", "Resource not found", request_id)
+            return 404
+        if not target.is_file():
+            self._json_error(404, "not_found", "Resource not found", request_id)
+            return 404
+        data = target.read_bytes()
+        content_type = STATIC_TYPES.get(target.suffix.lower()) or (
+            mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        )
+        self._write(200, data, content_type=content_type,
+                    extra_headers={"Cache-Control": "no-cache"},
+                    request_id=request_id)
+        return 200
+
+    # -- dispatch ---------------------------------------------------------
+    def _handle(self, method):
+        started = time.monotonic()
+        request_id = new_request_id()
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+        remote = self.client_address[0] if self.client_address else "-"
+        status = 500
+        actor = None
+
+        limiter: RateLimiter = self.server.rate_limiter
+        allowed, retry_after = limiter.allow(remote)
+        if not allowed:
+            status = 429
+            self._json_error(429, "rate_limited",
+                             "Too many requests; slow down and retry.", request_id,
+                             extra_headers={"Retry-After": str(retry_after)})
+            self._log(method, path, status, started, remote, actor, request_id)
+            return
+
+        if path.startswith("/media/"):
+            if method not in ("GET", "HEAD"):
+                status = 405
+                self._json_error(405, "method_not_allowed", "Method not allowed", request_id)
+            else:
+                status = self._serve_media(path, query, request_id)
+        elif path.startswith("/api"):
+            try:
+                identity = self._identity()
+                actor = (identity or {}).get("actor")
+                if method == "POST" and api.is_media_upload(path):
+                    raw = self._raw_body(get_settings().max_upload_bytes)
+                    result = api.handle_media_upload(
+                        identity,
+                        self.headers.get("Content-Type", ""),
+                        self.headers.get("X-Filename", ""),
+                        raw,
+                        request_id,
+                    )
+                else:
+                    body = self._body() if method in ("POST", "PUT", "PATCH", "DELETE") else {}
+                    result = api.handle(method, path, query, body, identity,
+                                        request_id=request_id, remote=remote)
+                status = result.status
+                self._write(status, result.payload, result.content_type,
+                            result.headers, request_id)
+            except OverflowError as exc:
+                status = 413
+                self._json_error(413, "payload_too_large", str(exc), request_id)
+            except ValueError as exc:
+                status = 400
+                self._json_error(400, "validation_error", str(exc), request_id)
+            except Exception:
+                traceback.print_exc()
+                status = 500
+                self._json_error(500, "internal_error",
+                                 "The operation failed. Check server logs for details.",
+                                 request_id)
+        elif method == "GET":
+            status = self._serve_static(path, request_id)
+        else:
+            status = 405
+            self._json_error(405, "method_not_allowed", "Method not allowed", request_id)
+
+        self._log(method, path, status, started, remote, actor, request_id)
+
+    def _log(self, method, path, status, started, remote, actor, request_id):
+        log_access(
+            request_id=request_id, method=method, path=path, status=status,
+            duration_ms=(time.monotonic() - started) * 1000,
+            remote=remote, actor=actor,
+        )
 
     def do_GET(self):
-        try:
-            parsed=urlparse(self.path); path=parsed.path; qs=parse_qs(parsed.query)
-            if path == '/api/health': return self.json({'status':'ok','version':'0.1.0','demo_mode':DEMO_MODE})
-            if path.startswith('/api/') and not self.require('read'): return
-            if path == '/api/dashboard':
-                return self.json(services.personal_dashboard(self.actor) if self.role in ('learner','manager') else services.dashboard())
-            if path == '/api/me': return self.json(services.get_employee(self.actor) or {'employee_id':self.actor,'display_name':self.actor,'roles':[]})
-            if path == '/api/employees':
-                if not self.require('manage_people'): return
-                return self.json(services.list_employees())
-            if path == '/api/courses': return self.json(services.list_courses())
-            if path == '/api/policies':
-                if not self.require('manage_learning'): return
-                return self.json(services.list_policies())
-            if path == '/api/assignments':
-                requested = qs.get('employee_id',[None])[0]
-                if self.role in ('learner','manager'):
-                    requested = self.actor
-                elif not self.require('complete_any'): return
-                return self.json(services.list_assignments(requested))
-            if path == '/api/audit':
-                if not self.require('audit'): return
-                return self.json(services.audit_events(int(qs.get('limit',[200])[0])))
-            if path == '/api/import-jobs':
-                if not self.require('hris'): return
-                return self.json(services.import_jobs())
-            return self.static(path)
-        except Exception as exc: self.fail(exc)
+        self._handle("GET")
+
+    def do_HEAD(self):
+        self._handle("GET")
 
     def do_POST(self):
-        try:
-            path=urlparse(self.path).path; data=self.body()
-            if path == '/api/session':
-                if not DEMO_MODE: return self.json({'error':'disabled','message':'Demo sessions are disabled; configure enterprise authentication.'},403)
-                role = str(data.get('role','learner'))
-                actor = str(data.get('actor','')).strip()
-                if role not in ROLE_PERMISSIONS or not actor: return self.json({'error':'validation_error','message':'Valid role and actor are required'},400)
-                return self.json({'token':issue_demo_token(role,actor),'role':role,'actor':actor,'expires_in':3600})
-            if path == '/api/employees':
-                if not self.require('manage_people'): return
-                return self.json(services.create_employee(data,self.actor),201)
-            if path == '/api/courses':
-                if not self.require('manage_learning'): return
-                return self.json(services.create_course(data,self.actor),201)
-            if path == '/api/policies':
-                if not self.require('manage_learning'): return
-                return self.json(services.create_policy(data,self.actor),201)
-            if path == '/api/assignments':
-                if not self.require('manage_learning'): return
-                return self.json(services.assign_course(data['employee_id'],data['course_code'],data.get('due_days',30),self.actor),201)
-            if path == '/api/assignments/complete':
-                if not self.identity: return self.json({'error':'unauthorized','message':'A valid session is required'},401)
-                target = str(data['employee_id'])
-                if self.role in ('learner','manager'):
-                    if not self.require('complete_self'): return
-                    if self.actor != target: return self.json({'error':'forbidden','message':'This role may complete only its own assignments'},403)
-                elif not self.require('complete_any'): return
-                return self.json(services.complete_assignment(target,data['course_code'],data.get('score'),self.actor))
-            if path == '/api/policies/apply':
-                if not self.require('manage_learning'): return
-                return self.json({'assignments_created':services.apply_policies(actor=self.actor)})
-            if path == '/api/hris/analyze':
-                if not self.require('hris'): return
-                result=hris.analyze(data.get('csv',''),data.get('mode','full'),int(data.get('max_population_change_pct',25)))
-                result.pop('normalized',None); return self.json(result)
-            if path == '/api/hris/apply':
-                if not self.require('hris'): return
-                result=hris.apply(data.get('csv',''),data.get('filename','employee_extract.csv'),data.get('mode','full'),self.actor,int(data.get('max_population_change_pct',25)))
-                return self.json(result,201)
-            return self.json({'error':'not_found'},404)
-        except (ValueError,KeyError) as exc: self.json({'error':'validation_error','message':str(exc)},400)
-        except Exception as exc: self.fail(exc)
+        self._handle("POST")
 
-    def fail(self, exc):
-        traceback.print_exc()
-        self.json({'error':'internal_error','message':'The operation failed. Check server logs for details.'},500)
+    def do_PATCH(self):
+        self._handle("PATCH")
 
-def main():
-    parser=argparse.ArgumentParser(description='Corporate LMS MVP server')
-    parser.add_argument('--host',default=os.environ.get('LMS_HOST','127.0.0.1'))
-    parser.add_argument('--port',type=int,default=int(os.environ.get('LMS_PORT','8080')))
-    parser.add_argument('--no-seed',action='store_true')
-    args=parser.parse_args()
-    if DEMO_MODE and args.host not in ('127.0.0.1','localhost','::1') and not ALLOW_REMOTE_DEMO:
-        parser.error('Demo mode may bind only to loopback unless LMS_ALLOW_REMOTE_DEMO=true is explicitly set')
+    def do_DELETE(self):
+        self._handle("DELETE")
+
+    def log_message(self, fmt, *args):  # pragma: no cover - overridden by structured log
+        return
+
+
+class LmsServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, address, handler=Handler, rate_limit_per_minute=None):
+        settings = get_settings()
+        if rate_limit_per_minute is None:
+            rate_limit_per_minute = settings.rate_limit_per_minute
+        self.rate_limiter = RateLimiter(rate_limit_per_minute)
+        super().__init__(address, handler)
+
+
+def create_server(host=None, port=None, *, rate_limit_per_minute=None):
+    settings = get_settings()
+    server = LmsServer(
+        (host or settings.host, int(port if port is not None else settings.port)),
+        rate_limit_per_minute=rate_limit_per_minute,
+    )
+    return server
+
+
+def main(argv=None):
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    parser = argparse.ArgumentParser(description="Corporate LMS server")
+    parser.add_argument("--host", default=settings.host)
+    parser.add_argument("--port", type=int, default=settings.port)
+    parser.add_argument("--no-seed", action="store_true")
+    parser.add_argument("--migrate-only", action="store_true",
+                        help="Apply database migrations and exit")
+    parser.add_argument("--sweep-notifications", action="store_true",
+                        help="Run due/overdue/recertification notification sweeps and exit")
+    args = parser.parse_args(argv)
+
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not settings.allow_remote_demo:
+        if settings.demo_mode:
+            parser.error(
+                "Demo mode may bind only to loopback unless "
+                "LMS_ALLOW_REMOTE_DEMO=true is explicitly set"
+            )
+
     init_db()
-    if not args.no_seed: seed()
-    server=ThreadingHTTPServer((args.host,args.port),Handler)
-    print(f'Corporate LMS v0.1.0 running at http://{args.host}:{args.port}')
-    try: server.serve_forever()
-    except KeyboardInterrupt: pass
-    finally: server.server_close()
+    if args.migrate_only:
+        from .db import schema_version
+        print(f"Database schema version: {schema_version()}")
+        return 0
+    if args.sweep_notifications:
+        from . import services
+        print(json.dumps(services.run_notification_sweeps(), indent=2))
+        return 0
+    if not args.no_seed and settings.seed_on_start:
+        seed()
 
-if __name__ == '__main__': main()
+    server = create_server(args.host, args.port)
+    print(f"Corporate LMS v{settings.version} running at http://{args.host}:{args.port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
