@@ -31,6 +31,7 @@ EMPLOYEE_FIELDS = [
 ASSIGNMENT_STATUSES = ("assigned", "in_progress", "completed", "failed", "exempted", "expired")
 ACTIVE_STATUSES = ("assigned", "in_progress", "failed")
 POLICY_OPERATORS = ("equals", "not_equals", "contains", "not_contains", "in", "not_in", "starts_with")
+POLICY_ATTRIBUTES = tuple(EMPLOYEE_FIELDS) + ("cohort", "cohort_name")
 
 
 def utc_now() -> str:
@@ -271,13 +272,16 @@ def create_policy(data, actor="admin"):
     course_code = str(data["course_code"]).strip().upper()
     if not get_course(course_code):
         raise ValueError(f"Unknown course: {course_code}")
+    attribute = str(data["attribute"]).strip().lower()
+    if attribute not in POLICY_ATTRIBUTES:
+        raise ValueError("attribute must be one of: " + ", ".join(POLICY_ATTRIBUTES))
     due_days = int(data.get("due_days", 30))
     if due_days < 0 or due_days > 3650:
         raise ValueError("due_days must be between 0 and 3650")
     with connection() as conn:
         cur = conn.execute(
             "INSERT INTO assignment_policies(name,course_code,attribute,operator,value,due_days) VALUES(?,?,?,?,?,?)",
-            (data["name"], course_code, data["attribute"], operator, data["value"], due_days),
+            (data["name"], course_code, attribute, operator, data["value"], due_days),
         )
         pid = cur.lastrowid
         record("AssignmentPolicyCreated", actor, "assignment_policy", pid, data, conn=conn)
@@ -291,25 +295,40 @@ def list_policies():
     )
 
 
-def policy_matches(emp, policy) -> bool:
-    actual = str(emp.get(policy["attribute"], "") or "").strip().lower()
-    expected = str(policy["value"]).strip().lower()
-    op = policy.get("operator", "equals")
-    if op == "equals":
+def _match_policy_value(actual, expected, operator) -> bool:
+    if operator == "equals":
         return actual == expected
-    if op == "not_equals":
+    if operator == "not_equals":
         return actual != expected
-    if op == "contains":
+    if operator == "contains":
         return expected in actual
-    if op == "not_contains":
+    if operator == "not_contains":
         return expected not in actual
-    if op == "in":
-        return actual in [x.strip().lower() for x in expected.split("|")]
-    if op == "not_in":
-        return actual not in [x.strip().lower() for x in expected.split("|")]
-    if op == "starts_with":
+    if operator == "in":
+        return actual in [item.strip().lower() for item in expected.split("|")]
+    if operator == "not_in":
+        return actual not in [item.strip().lower() for item in expected.split("|")]
+    if operator == "starts_with":
         return actual.startswith(expected)
     return False
+
+
+def policy_matches(emp, policy, conn=None) -> bool:
+    attribute = str(policy["attribute"]).strip().lower()
+    expected = str(policy["value"]).strip().lower()
+    operator = policy.get("operator", "equals")
+    if attribute in ("cohort", "cohort_name"):
+        # Imported lazily: engagement depends on services for enrolment.
+        from . import engagement
+        field = "code" if attribute == "cohort" else "name"
+        values = [str(item.get(field, "")).lower()
+                  for item in engagement.cohorts_for_employee(emp["employee_id"], conn)]
+        if operator in ("not_equals", "not_contains", "not_in"):
+            return all(not _match_policy_value(value, expected, operator[3:])
+                       for value in values)
+        return any(_match_policy_value(value, expected, operator) for value in values)
+    actual = str(emp.get(attribute, "") or "").strip().lower()
+    return _match_policy_value(actual, expected, operator)
 
 
 def apply_policies(employee_ids=None, actor="system", conn=None):
@@ -327,7 +346,7 @@ def apply_policies(employee_ids=None, actor="system", conn=None):
         created = 0
         for emp in employees:
             for pol in policies:
-                if not policy_matches(emp, pol):
+                if not policy_matches(emp, pol, db):
                     continue
                 exists = db.execute(
                     "SELECT 1 FROM assignments WHERE employee_id=? AND course_code=? LIMIT 1",
@@ -378,7 +397,13 @@ def _latest_assignment(conn, employee_id, course_code):
 def assign_course(employee_id, course_code, due_days=30, actor="admin", conn=None,
                   source="manual"):
     course_code = str(course_code).strip().upper()
-    due = (today() + timedelta(days=int(due_days))).isoformat()
+    try:
+        due_days = int(due_days)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("due_days must be an integer") from exc
+    if not 0 <= due_days <= 3650:
+        raise ValueError("due_days must be between 0 and 3650")
+    due = (today() + timedelta(days=due_days)).isoformat()
     with _maybe_connection(conn) as db:
         employee = db.execute(
             "SELECT * FROM employees WHERE employee_id=?", (employee_id,)
@@ -513,7 +538,23 @@ def complete_assignment(employee_id, course_code, score=None, actor=None):
                     },
                     entity_type="assignment", entity_id=entity,
                 )
-    return row("SELECT * FROM assignments WHERE id=?", (assignment["id"],))
+    result = dict(row("SELECT * FROM assignments WHERE id=?", (assignment["id"],)))
+    result["progression"] = {"awarded": [], "advanced": []}
+    if status == "completed":
+        # Imported lazily to avoid a module cycle: engagement uses assign_course.
+        # Progression is best-effort: the completion is already committed, so a
+        # downstream award/enrolment failure must not roll back or reject it.
+        from . import engagement
+        try:
+            result["progression"] = engagement.on_course_completed(
+                employee_id, course_code, score, actor
+            )
+        except Exception as exc:
+            record("ProgressionFailed", actor, "assignment", entity,
+                   {"error": str(exc)[:200]})
+            result["progression"] = {"awarded": [], "advanced": [],
+                                     "deferred": True}
+    return result
 
 
 def exempt_assignment(employee_id, course_code, reason, actor):
@@ -605,12 +646,20 @@ def list_assignments(employee_id=None):
     return rows(q, params)
 
 
-def search_assignments(employee_id=None, status=None, course_code=None,
-                       department=None, overdue=None, q=None, limit=100, offset=0):
+def search_assignments(employee_id=None, employee_ids=None, status=None,
+                       course_code=None, department=None, overdue=None, q=None,
+                       limit=100, offset=0):
     limit = max(1, min(int(limit), 500))
     offset = max(0, int(offset))
     clauses, params = [], []
-    if employee_id:
+    if employee_ids is not None:
+        ids = [str(item) for item in employee_ids]
+        if not ids:
+            clauses.append("1 = 0")
+        else:
+            clauses.append("a.employee_id IN (%s)" % ",".join("?" for _ in ids))
+            params.extend(ids)
+    elif employee_id:
         clauses.append("a.employee_id = ?")
         params.append(employee_id)
     if status:

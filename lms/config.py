@@ -12,7 +12,7 @@ import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 PACKAGE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_ROOT.parent
 STATIC_DIR = PACKAGE_ROOT / "static"

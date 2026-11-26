@@ -146,10 +146,16 @@ def _question(conn, lesson_id, prompt, options, correct, explanation, position):
 
 
 def _seed_content(conn) -> bool:
-    if conn.execute("SELECT COUNT(*) FROM course_modules").fetchone()[0]:
-        return False
     codes = {r["course_code"] for r in conn.execute("SELECT course_code FROM courses")}
     if not codes:
+        return False
+    seeded = {
+        r["course_code"] for r in conn.execute(
+            "SELECT DISTINCT course_code FROM course_modules"
+        )
+    }
+    pending = [code for code in COURSE_META if code in codes and code not in seeded]
+    if not pending:
         return False
 
     for code, meta in COURSE_META.items():
@@ -165,7 +171,7 @@ def _seed_content(conn) -> bool:
              meta["tags"], meta["language"], code),
         )
 
-    if "SEC-101" in codes:
+    if "SEC-101" in pending:
         first = _module(conn, "SEC-101", "Security fundamentals",
                         "Why security is everyone's job.", 1)
         _lesson(conn, first, "SEC-101", "Why security matters", "text",
@@ -191,7 +197,7 @@ def _seed_content(conn) -> bool:
                    "Buy a replacement first", "Change nothing"], 1,
                   "Immediate reporting lets the team revoke access and protect data.", 3)
 
-    if "ETH-101" in codes:
+    if "ETH-101" in pending:
         module = _module(conn, "ETH-101", "Our code of conduct",
                          "Ethical decisions and speaking up.", 1)
         _lesson(conn, module, "ETH-101", "Speaking up", "text", ETHICS_TEXT, 6, 1)
@@ -206,7 +212,7 @@ def _seed_content(conn) -> bool:
                    "Support the person and report it", "Post about it publicly"], 2,
                   "Support the person and use the reporting channel.", 2)
 
-    if "ENG-201" in codes:
+    if "ENG-201" in pending:
         module = _module(conn, "ENG-201", "Secure by design",
                          "Threat modelling and secure coding habits.", 1)
         _lesson(conn, module, "ENG-201", "Threat modelling basics", "text",
@@ -216,7 +222,7 @@ def _seed_content(conn) -> bool:
         _lesson(conn, module, "ENG-201", "Secure coding habits", "youtube",
                 "aqz-KE-bpKQ", 3, 3)
 
-    if "MGR-101" in codes:
+    if "MGR-101" in pending:
         module = _module(conn, "MGR-101", "Leading learning",
                          "Coaching conversations and team signals.", 1)
         _lesson(conn, module, "MGR-101", "Coaching conversations", "text",
@@ -232,6 +238,97 @@ def _seed_content(conn) -> bool:
                    "Comparing them to a colleague", "Waiting for the annual review"], 1,
                   "Specific, timely feedback with agreed actions drives change.", 2)
 
+    return True
+
+
+def _seed_engagement(conn) -> bool:
+    """Seed the Moodle-like layer without overwriting operator-created data."""
+    if conn.execute("SELECT COUNT(*) FROM cohorts").fetchone()[0]:
+        return False
+    employees = [r["employee_id"] for r in conn.execute("SELECT employee_id FROM employees")]
+    courses = {r["course_code"] for r in conn.execute("SELECT course_code FROM courses")}
+    if not employees or not courses:
+        return False
+
+    cohorts = [
+        ("ALL-STAFF", "All staff", "Everyone in the demo organization.", employees),
+        ("ENG-TEAM", "Engineering team",
+         "Engineering employees for targeted technical learning.",
+         [e for e in employees if e in {"E1001", "E1002", "E1003"}]),
+    ]
+    for code, name, description, members in cohorts:
+        cur = conn.execute(
+            "INSERT INTO cohorts(code,name,description) VALUES(?,?,?)",
+            (code, name, description),
+        )
+        cohort_id = int(cur.lastrowid)
+        conn.executemany(
+            "INSERT INTO cohort_members(cohort_id,employee_id,added_by) VALUES(?,?,'seed')",
+            [(cohort_id, employee_id) for employee_id in members],
+        )
+
+    paths = [
+        ("CORE-ONBOARD", "Core onboarding", "Start with security, then code of conduct.",
+         ["SEC-101", "ETH-101"]),
+        ("SECURE-ENG", "Secure engineering", "Security foundations for engineers.",
+         ["SEC-101", "ENG-201"]),
+    ]
+    path_ids = {}
+    for code, title, description, codes in paths:
+        available = [c for c in codes if c in courses]
+        if not available:
+            continue
+        cur = conn.execute(
+            "INSERT INTO learning_paths(code,title,description,status,created_by) "
+            "VALUES(?,?,?,'published','system')",
+            (code, title, description),
+        )
+        path_id = int(cur.lastrowid)
+        path_ids[code] = path_id
+        conn.executemany(
+            "INSERT INTO learning_path_courses(path_id,course_code,position,is_required) "
+            "VALUES(?,?,?,1)",
+            [(path_id, course_code, position)
+             for position, course_code in enumerate(available, start=1)],
+        )
+
+    badges = [
+        ("SEC-FOUNDATION", "Security foundation", "Complete Information Security Essentials.",
+         "shield", "SEC-101", None),
+        ("ETH-FOUNDATION", "Ethics foundation", "Complete the Code of Conduct.",
+         "book", "ETH-101", None),
+        ("CORE-COMPLETE", "Core onboarding complete", "Finish the core onboarding path.",
+         "certificate", None, path_ids.get("CORE-ONBOARD")),
+    ]
+    for code, title, description, icon, course_code, path_id in badges:
+        if course_code and course_code not in courses:
+            continue
+        if path_id is None and course_code is None:
+            continue
+        conn.execute(
+            "INSERT INTO badges(code,title,description,icon,criteria_course_code,criteria_path_id) "
+            "VALUES(?,?,?,?,?,?)",
+            (code, title, description, icon, course_code, path_id),
+        )
+
+    if "SEC-101" in courses:
+        cur = conn.execute(
+            "INSERT INTO discussions(course_code,title,body,created_by,pinned) "
+            "VALUES('SEC-101','Questions about reporting incidents',"
+            "'Ask here if you are unsure how to report a suspected incident. "
+            "Do not include sensitive details in the thread.','E1004',1)"
+        )
+        discussion_id = int(cur.lastrowid)
+        conn.execute(
+            "INSERT INTO discussion_posts(discussion_id,author_id,body) VALUES(?,?,?)",
+            (discussion_id, "E1004",
+             "Use the incident portal first. If access fails, call the security hotline "
+             "and record the time you noticed the issue."),
+        )
+
+    record("SampleEngagementSeeded", "system", "platform", "seed",
+           {"cohorts": len(cohorts), "paths": len(path_ids), "badges": len(badges)},
+           conn=conn)
     return True
 
 
@@ -279,9 +376,11 @@ def seed():
             seeded = True
 
         seeded_content = _seed_content(conn)
-        if seeded or seeded_content:
+        seeded_engagement = _seed_engagement(conn)
+        if seeded or seeded_content or seeded_engagement:
             record('SampleDataSeeded', 'system', 'platform', 'seed',
-                   {'employees': 4, 'courses': 4, 'content': seeded_content}, conn=conn)
+                   {'employees': 4, 'courses': 4, 'content': seeded_content,
+                    'engagement': seeded_engagement}, conn=conn)
 
     apply_policies(actor='system')
     return seeded

@@ -132,15 +132,23 @@ def apply(csv_text, filename='employee_extract.csv', mode='full', actor='integra
         cur = conn.execute("INSERT INTO import_jobs(filename,checksum,mode,status,row_count,accepted_count,rejected_count,create_count,update_count,suspend_count,summary_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (filename,analysis['checksum'],mode,'applying',analysis['row_count'],analysis['accepted_count'],analysis['rejected_count'],len(analysis['creates']),len(analysis['updates']),len(analysis['suspends']),json.dumps({k:v for k,v in analysis.items() if k!='normalized'})))
         job_id = cur.lastrowid
-        manager_ids = {
-            row['manager_employee_id'] for row in conn.execute(
-                "SELECT manager_employee_id FROM employees WHERE manager_employee_id IS NOT NULL AND employment_status='active'"
-            ).fetchall()
-        }
-        manager_ids |= {
+        incoming_managers = {
             emp['manager_employee_id'] for emp in analysis['normalized']
             if emp.get('manager_employee_id')
         }
+        if mode == 'full':
+            # A full extract is authoritative: reporting lines removed from the
+            # file must not leave stale manager grants behind.
+            manager_ids = incoming_managers
+        else:
+            # A delta extract is partial, so preserve reporting lines that are
+            # not represented in this file.
+            manager_ids = {
+                row['manager_employee_id'] for row in conn.execute(
+                    "SELECT manager_employee_id FROM employees "
+                    "WHERE manager_employee_id IS NOT NULL AND employment_status='active'"
+                ).fetchall()
+            } | incoming_managers
         for emp in analysis['normalized']:
             existing = conn.execute("SELECT employee_id FROM employees WHERE employee_id=?", (emp['employee_id'],)).fetchone()
             if existing:
@@ -152,7 +160,9 @@ def apply(csv_text, filename='employee_extract.csv', mode='full', actor='integra
                 cols = ','.join(EMPLOYEE_FIELDS); marks=','.join('?' for _ in EMPLOYEE_FIELDS)
                 conn.execute(f"INSERT INTO employees({cols}) VALUES({marks})", [emp[f] for f in EMPLOYEE_FIELDS])
                 event = 'EmployeeCreated'
-            conn.execute("DELETE FROM employee_roles WHERE employee_id=? AND assigned_by='hris'", (emp['employee_id'],))
+            # HRIS is authoritative for derived roles: clear stale manager and
+            # instructor grants, including ones created by an older seed/import.
+            conn.execute("DELETE FROM employee_roles WHERE employee_id=? AND role!='learner'", (emp['employee_id'],))
             for role, scope in _derived_roles(emp, analysis['normalized'], manager_ids):
                 conn.execute("INSERT OR IGNORE INTO employee_roles(employee_id,role,scope,assigned_by) VALUES(?,?,?,'hris')", (emp['employee_id'],role,scope))
             record(event, actor, 'employee', emp['employee_id'], {'import_job_id':job_id}, conn=conn)

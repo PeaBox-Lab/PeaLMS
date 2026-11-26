@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import re
 import time
 import uuid
@@ -27,7 +28,6 @@ ALLOWED_TYPES: dict[str, tuple[str, str]] = {
     "video/mp4": ("video", ".mp4"),
     "video/webm": ("video", ".webm"),
     "video/quicktime": ("video", ".mov"),
-    "video/x-matroska": ("video", ".mkv"),
     "image/png": ("image", ".png"),
     "image/jpeg": ("image", ".jpg"),
     "image/gif": ("image", ".gif"),
@@ -36,7 +36,7 @@ ALLOWED_TYPES: dict[str, tuple[str, str]] = {
 }
 
 SAFE_FILENAME = re.compile(r"[^A-Za-z0-9._ -]+")
-DEFAULT_TTL = 3600
+DEFAULT_TTL = 300
 
 
 def media_dir() -> Path:
@@ -70,45 +70,74 @@ def _looks_like(content_type: str, data: bytes) -> bool:
     return False
 
 
-def store(filename: str, content_type: str, data: bytes, uploaded_by: str | None = None) -> dict:
+def store_stream(filename: str, content_type: str, stream,
+                 uploaded_by: str | None = None) -> dict:
+    """Store an upload from a file-like object without buffering it in memory."""
     settings = get_settings()
     content_type = str(content_type or "").split(";")[0].strip().lower()
     if content_type not in ALLOWED_TYPES:
         raise ValueError(
             "Unsupported media type. Allowed: " + ", ".join(sorted(ALLOWED_TYPES))
         )
-    if not data:
-        raise ValueError("The uploaded file is empty")
-    if len(data) > settings.max_upload_bytes:
-        raise ValueError(
-            f"File exceeds the {settings.max_upload_bytes} byte upload limit"
-        )
-    if not _looks_like(content_type, data):
-        raise ValueError("File content does not match the declared media type")
+    if hasattr(stream, "seek"):
+        stream.seek(0)
 
     kind, extension = ALLOWED_TYPES[content_type]
     stored_name = f"{uuid.uuid4().hex}{extension}"
     directory = media_dir()
     target = directory / stored_name
     temporary = directory / (stored_name + ".part")
-    temporary.write_bytes(data)
-    temporary.replace(target)
+    digest = hashlib.sha256()
+    header = b""
+    total = 0
+    try:
+        with temporary.open("wb") as handle:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > settings.max_upload_bytes:
+                    raise ValueError(
+                        f"File exceeds the {settings.max_upload_bytes} byte upload limit"
+                    )
+                if len(header) < 16:
+                    header += chunk[:16 - len(header)]
+                digest.update(chunk)
+                handle.write(chunk)
+        if not total:
+            raise ValueError("The uploaded file is empty")
+        if not _looks_like(content_type, header):
+            raise ValueError("File content does not match the declared media type")
+        temporary.replace(target)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
 
-    checksum = hashlib.sha256(data).hexdigest()
-    with connection() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO media(filename,stored_name,content_type,size_bytes,kind,checksum,uploaded_by)
-            VALUES(?,?,?,?,?,?,?)
-            """,
-            (_clean_filename(filename), stored_name, content_type, len(data),
-             kind, checksum, uploaded_by),
-        )
-        media_id = int(cur.lastrowid)
-        record("MediaUploaded", uploaded_by or "system", "media", media_id,
-               {"filename": _clean_filename(filename), "content_type": content_type,
-                "size_bytes": len(data), "kind": kind}, conn=conn)
-    return get(media_id)
+    try:
+        with connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO media(filename,stored_name,content_type,size_bytes,kind,checksum,uploaded_by)
+                VALUES(?,?,?,?,?,?,?)
+                """,
+                (_clean_filename(filename), stored_name, content_type, total,
+                 kind, digest.hexdigest(), uploaded_by),
+            )
+            media_id = int(cur.lastrowid)
+            record("MediaUploaded", uploaded_by or "system", "media", media_id,
+                   {"filename": _clean_filename(filename), "content_type": content_type,
+                    "size_bytes": total, "kind": kind}, conn=conn)
+        return get(media_id)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+
+
+def store(filename: str, content_type: str, data: bytes,
+          uploaded_by: str | None = None) -> dict:
+    """Compatibility wrapper for callers that already hold the whole file."""
+    return store_stream(filename, content_type, io.BytesIO(data), uploaded_by)
 
 
 def get(media_id) -> dict | None:
@@ -148,4 +177,5 @@ def verify(media_id, expires, signature) -> bool:
     return hmac.compare_digest(str(signature or ""), expected)
 
 
-__all__ = ["ALLOWED_TYPES", "file_path", "get", "media_dir", "store", "url_for", "verify"]
+__all__ = ["ALLOWED_TYPES", "file_path", "get", "media_dir", "store",
+           "store_stream", "url_for", "verify"]

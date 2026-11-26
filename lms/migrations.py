@@ -343,6 +343,148 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX IF NOT EXISTS idx_courses_status ON courses(status, active)",
         ),
     ),
+    Migration(
+        4,
+        "engagement_and_credentials",
+        (
+            # Cohorts group people for targeting, reporting and enrolment.
+            """
+            CREATE TABLE cohorts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              code TEXT NOT NULL UNIQUE,
+              name TEXT NOT NULL,
+              description TEXT NOT NULL DEFAULT '',
+              active INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            CREATE TABLE cohort_members (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              cohort_id INTEGER NOT NULL,
+              employee_id TEXT NOT NULL,
+              added_by TEXT,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE(cohort_id, employee_id),
+              FOREIGN KEY(cohort_id) REFERENCES cohorts(id) ON DELETE CASCADE,
+              FOREIGN KEY(employee_id) REFERENCES employees(employee_id) ON DELETE CASCADE
+            )
+            """,
+            # Learning paths are ordered course sequences with auto-advancement.
+            """
+            CREATE TABLE learning_paths (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              code TEXT NOT NULL UNIQUE,
+              title TEXT NOT NULL,
+              description TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'published',
+              created_by TEXT,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            CREATE TABLE learning_path_courses (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              path_id INTEGER NOT NULL,
+              course_code TEXT NOT NULL,
+              position INTEGER NOT NULL DEFAULT 0,
+              is_required INTEGER NOT NULL DEFAULT 1,
+              UNIQUE(path_id, course_code),
+              FOREIGN KEY(path_id) REFERENCES learning_paths(id) ON DELETE CASCADE,
+              FOREIGN KEY(course_code) REFERENCES courses(course_code) ON DELETE CASCADE
+            )
+            """,
+            # Badges and verifiable completion certificates.
+            """
+            CREATE TABLE badges (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              code TEXT NOT NULL UNIQUE,
+              title TEXT NOT NULL,
+              description TEXT NOT NULL DEFAULT '',
+              icon TEXT NOT NULL DEFAULT 'star',
+              criteria_course_code TEXT,
+              criteria_path_id INTEGER,
+              active INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY(criteria_course_code) REFERENCES courses(course_code) ON DELETE CASCADE,
+              FOREIGN KEY(criteria_path_id) REFERENCES learning_paths(id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE badge_awards (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              badge_id INTEGER NOT NULL,
+              employee_id TEXT NOT NULL,
+              verification_code TEXT NOT NULL UNIQUE,
+              source TEXT NOT NULL DEFAULT 'course_completion',
+              score REAL,
+              awarded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE(badge_id, employee_id),
+              FOREIGN KEY(badge_id) REFERENCES badges(id) ON DELETE CASCADE,
+              FOREIGN KEY(employee_id) REFERENCES employees(employee_id) ON DELETE CASCADE
+            )
+            """,
+            # Course discussions: lightweight, moderated forums.
+            """
+            CREATE TABLE discussions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              course_code TEXT NOT NULL,
+              title TEXT NOT NULL,
+              body TEXT NOT NULL DEFAULT '',
+              created_by TEXT NOT NULL,
+              pinned INTEGER NOT NULL DEFAULT 0,
+              closed INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY(course_code) REFERENCES courses(course_code) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE discussion_posts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              discussion_id INTEGER NOT NULL,
+              parent_id INTEGER,
+              author_id TEXT NOT NULL,
+              body TEXT NOT NULL,
+              edited_at TEXT,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY(discussion_id) REFERENCES discussions(id) ON DELETE CASCADE,
+              FOREIGN KEY(parent_id) REFERENCES discussion_posts(id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_cohort_members_employee ON cohort_members(employee_id, cohort_id)",
+            "CREATE INDEX IF NOT EXISTS idx_cohort_members_cohort ON cohort_members(cohort_id)",
+            "CREATE INDEX IF NOT EXISTS idx_path_courses_path ON learning_path_courses(path_id, position)",
+            "CREATE INDEX IF NOT EXISTS idx_badges_criteria ON badges(criteria_course_code, criteria_path_id)",
+            "CREATE INDEX IF NOT EXISTS idx_badge_awards_employee ON badge_awards(employee_id, awarded_at)",
+            "CREATE INDEX IF NOT EXISTS idx_discussions_course ON discussions(course_code, pinned DESC, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_posts_discussion ON discussion_posts(discussion_id, created_at)",
+        ),
+    ),
+    Migration(
+        5,
+        "session_controls",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS session_revocations (
+              jti TEXT PRIMARY KEY,
+              actor TEXT NOT NULL,
+              revoked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS app_state (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            "INSERT OR IGNORE INTO app_state(key, value) VALUES('session_epoch', '0')",
+            "CREATE INDEX IF NOT EXISTS idx_session_revocations_actor ON session_revocations(actor)",
+        ),
+    ),
 )
 
 SCHEMA_VERSION = max(m.version for m in MIGRATIONS)

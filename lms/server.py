@@ -12,6 +12,7 @@ import json
 import mimetypes
 import re
 import sys
+import tempfile
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -77,11 +78,21 @@ class Handler(BaseHTTPRequestHandler):
         self._write(status, {"error": error, "message": message},
                     extra_headers=extra_headers, request_id=request_id)
 
+    def _method_not_allowed(self, request_id=""):
+        # Do not leave an unread request body on a keep-alive connection.
+        self.close_connection = True
+        self._json_error(405, "method_not_allowed", "Method not allowed",
+                         request_id,
+                         extra_headers={"Connection": "close", "Allow": "GET, HEAD"})
+
     # -- request helpers --------------------------------------------------
     def _identity(self):
         header = self.headers.get("Authorization", "")
         if header.startswith("Bearer "):
-            return verify_token(header[7:].strip())
+            return verify_token(
+                header[7:].strip(),
+                fingerprint=self.headers.get("User-Agent", ""),
+            )
         return None
 
     def _body(self):
@@ -103,7 +114,8 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("Request body must be a JSON object")
         return parsed
 
-    def _raw_body(self, limit):
+    def _stream_body(self, limit):
+        """Spool an upload to disk after a small threshold to bound memory use."""
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -112,7 +124,20 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("An upload body is required")
         if length > limit:
             raise OverflowError(f"Upload exceeds the {limit} byte limit")
-        return self.rfile.read(length)
+        stream = tempfile.SpooledTemporaryFile(max_size=1_048_576, mode="w+b")
+        remaining = length
+        try:
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    raise ValueError("Upload ended before Content-Length was reached")
+                stream.write(chunk)
+                remaining -= len(chunk)
+            stream.seek(0)
+            return stream
+        except Exception:
+            stream.close()
+            raise
 
     def _serve_media(self, path, query, request_id):
         """Serve a signed media object, honouring HTTP range requests."""
@@ -140,21 +165,32 @@ class Handler(BaseHTTPRequestHandler):
         size = target.stat().st_size
         start, end, status = 0, max(0, size - 1), 200
         range_header = (self.headers.get("Range") or "").strip()
-        if range_header.startswith("bytes=") and size:
-            spec = range_header[6:].split(",")[0]
-            first, _, last = spec.partition("-")
-            try:
-                if first == "":
-                    start = max(0, size - int(last))
-                    end = size - 1
-                else:
+        if range_header:
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
+            valid = bool(match and (match.group(1) or match.group(2)))
+            if valid:
+                first, last = match.group(1), match.group(2)
+                if first:
                     start = int(first)
                     end = int(last) if last else size - 1
-            except ValueError:
-                start, end = 0, size - 1
-            start = max(0, min(start, size - 1))
-            end = max(start, min(end, size - 1))
-            status = 206
+                    valid = start < size and end >= start
+                else:
+                    suffix = int(last or 0)
+                    valid = suffix > 0 and size > 0
+                    start, end = max(0, size - suffix), size - 1
+                if valid:
+                    end = min(end, size - 1)
+                    status = 206
+            if not valid:
+                self._write(
+                    416,
+                    {"error": "range_not_satisfiable",
+                     "message": "The requested byte range is not satisfiable"},
+                    extra_headers={"Content-Range": f"bytes */{size}",
+                                   "Cache-Control": "no-store"},
+                    request_id=request_id,
+                )
+                return 416
 
         length = max(0, end - start + 1) if size else 0
         headers = {"Cache-Control": "private, max-age=300", "Accept-Ranges": "bytes"}
@@ -213,9 +249,12 @@ class Handler(BaseHTTPRequestHandler):
         remote = self.client_address[0] if self.client_address else "-"
         status = 500
         actor = None
+        fingerprint = self.headers.get("User-Agent", "")
+        identity = self._identity() if self.headers.get("Authorization") else None
+        actor = (identity or {}).get("actor")
 
         limiter: RateLimiter = self.server.rate_limiter
-        allowed, retry_after = limiter.allow(remote)
+        allowed, retry_after = limiter.allow(f"{remote}|{actor or '-'}")
         if not allowed:
             status = 429
             self._json_error(429, "rate_limited",
@@ -227,26 +266,25 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/media/"):
             if method not in ("GET", "HEAD"):
                 status = 405
-                self._json_error(405, "method_not_allowed", "Method not allowed", request_id)
+                self._method_not_allowed(request_id)
             else:
                 status = self._serve_media(path, query, request_id)
         elif path.startswith("/api"):
             try:
-                identity = self._identity()
-                actor = (identity or {}).get("actor")
                 if method == "POST" and api.is_media_upload(path):
-                    raw = self._raw_body(get_settings().max_upload_bytes)
-                    result = api.handle_media_upload(
-                        identity,
-                        self.headers.get("Content-Type", ""),
-                        self.headers.get("X-Filename", ""),
-                        raw,
-                        request_id,
-                    )
+                    with self._stream_body(get_settings().max_upload_bytes) as upload:
+                        result = api.handle_media_upload(
+                            identity,
+                            self.headers.get("Content-Type", ""),
+                            self.headers.get("X-Filename", ""),
+                            upload,
+                            request_id,
+                        )
                 else:
                     body = self._body() if method in ("POST", "PUT", "PATCH", "DELETE") else {}
                     result = api.handle(method, path, query, body, identity,
-                                        request_id=request_id, remote=remote)
+                                        request_id=request_id, remote=remote,
+                                        fingerprint=fingerprint)
                 status = result.status
                 self._write(status, result.payload, result.content_type,
                             result.headers, request_id)
@@ -266,7 +304,7 @@ class Handler(BaseHTTPRequestHandler):
             status = self._serve_static(path, request_id)
         else:
             status = 405
-            self._json_error(405, "method_not_allowed", "Method not allowed", request_id)
+            self._method_not_allowed(request_id)
 
         self._log(method, path, status, started, remote, actor, request_id)
 

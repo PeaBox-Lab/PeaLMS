@@ -17,8 +17,19 @@ const state = {
   csvName: '',
   view: 'dashboard',
   catalogQuery: {},
-  auditOffset: 0,
+  cohorts: [],
+  paths: [],
+  badges: [],
+  gradebook: null,
+  discussions: [],
+  importSignature: '',
+  importSnapshot: null,
+  videoRefreshTimer: null,
 };
+
+let sessionGeneration = 0;
+let playerGeneration = 0;
+let lastRouteHash = '';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -47,11 +58,30 @@ function can(permission) {
   return state.permissions.has(permission);
 }
 
+function isCurrent(generation) {
+  return generation === sessionGeneration;
+}
+
+function canManagePaths() {
+  return can('manage_content') || can('manage_learning');
+}
+
+function canStartAssignment() {
+  return can('complete_any') || can('manage_learning') ||
+    (can('complete_team') && can('read_team'));
+}
+
+function canCompleteAssignment() {
+  return can('complete_any') || (can('complete_team') && can('read_team'));
+}
+
 function toast(message, isError = false) {
   const el = $('#toast');
   el.textContent = message;
   el.classList.toggle('error', isError);
   el.classList.add('show');
+  const alert = $('#alertToast');
+  if (alert) alert.textContent = isError ? message : '';
   clearTimeout(toast._timer);
   toast._timer = setTimeout(() => el.classList.remove('show'), 4000);
 }
@@ -60,10 +90,24 @@ function authHeaders() {
   return state.token ? { Authorization: 'Bearer ' + state.token } : {};
 }
 
+async function rawFetch(path, options = {}) {
+  const request = { ...options };
+  delete request.retry;
+  const headers = () => ({ ...authHeaders(), ...(request.headers || {}) });
+  let response = await fetch(path, { ...request, headers: headers() });
+  if (response.status === 401 && state.token) {
+    try { await refreshSession({ reload: false }); } catch (_) { /* retry once */ }
+    response = await fetch(path, { ...request, headers: headers() });
+  }
+  return response;
+}
+
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    headers: { 'Content-Type': 'application/json', ...authHeaders(), ...(options.headers || {}) },
+  const request = { ...options };
+  delete request.retry;
+  const response = await rawFetch(path, {
+    ...request,
+    headers: { 'Content-Type': 'application/json', ...(request.headers || {}) },
   });
   const text = await response.text();
   let data = {};
@@ -82,9 +126,10 @@ async function createSession(role, actor) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ role, actor }),
   });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.message || 'Unable to create demo session');
-  state.token = data.token;
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!response.ok) throw new Error(data.message || data.error || 'Unable to create session');
+  state.token = data.token || '';
 }
 
 async function refreshSession({ reload = true } = {}) {
@@ -92,12 +137,40 @@ async function refreshSession({ reload = true } = {}) {
   const actor = $('#actor').value.trim() || ROLE_DEFAULTS[role] || 'demo-admin';
   $('#actor').value = actor;
   await createSession(role, actor);
-  state.me = await api('/api/v1/me');
-  state.permissions = new Set(state.me.permissions || []);
+  const generation = ++sessionGeneration;
+  playerGeneration += 1;
+  if (state.videoRefreshTimer) {
+    clearTimeout(state.videoRefreshTimer);
+    state.videoRefreshTimer = null;
+  }
+  const me = await api('/api/v1/me');
+  if (!isCurrent(generation)) return;
+  state.me = me;
+  state.permissions = new Set(me.permissions || []);
   state.employees = [];
+  state.courses = [];
+  state.cohorts = [];
+  state.paths = [];
+  state.badges = [];
+  state.discussions = [];
+  state.course = null;
+  state.lessonId = null;
+  state.questionCache = [];
+  state.gradebook = null;
+  state.csvText = '';
+  state.csvName = '';
+  state.importSignature = '';
+  invalidateImport('');
+  const leftCourse = state.view === 'course';
+  if (leftCourse) {
+    const mount = $('#courseDetail');
+    if (mount) mount.innerHTML = '';
+    activateView('catalog');
+  }
   applyPermissions();
-  updateBell(state.me.unread_notifications || 0);
+  updateBell(me.unread_notifications || 0);
   if (reload) await loadView(state.view);
+  else if (leftCourse) await loadCatalog();
 }
 
 function applyPermissions() {
@@ -106,8 +179,14 @@ function applyPermissions() {
     el.hidden = !allowed;
     el.classList.toggle('is-hidden', !allowed);
   });
+  $$('[data-perm-any]').forEach((el) => {
+    const permissions = String(el.dataset.permAny).split(/[\s,]+/).filter(Boolean);
+    const allowed = permissions.some((permission) => can(permission));
+    el.hidden = !allowed;
+    el.classList.toggle('is-hidden', !allowed);
+  });
   const activeNav = $('nav button.active');
-  if (activeNav && activeNav.hidden) showView('dashboard');
+  if (activeNav && activeNav.hidden) showView('dashboard', false);
 }
 
 function updateBell(count) {
@@ -150,20 +229,23 @@ function statusTag(value) {
     failed: 'red', inactive: 'red', terminated: 'red', exempted: 'red',
     archived: '',
   };
-  return `<span class="tag ${map[value] || ''}">${esc(value)}</span>`;
+  const label = String(value || '').replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  return `<span class="tag ${map[value] || ''}">${esc(label)}</span>`;
 }
 
 function table(headers, rows) {
   if (!rows.length) return '<div class="empty">Nothing to show.</div>';
-  return `<div class="table-wrap"><table><thead><tr>${headers.map((h) => `<th>${esc(h)}</th>`).join('')}</tr></thead>` +
+  return `<div class="table-wrap"><table><thead><tr>${headers.map((h) => `<th scope="col">${esc(h)}</th>`).join('')}</tr></thead>` +
     `<tbody>${rows.map((cells) => `<tr>${cells.map((c) => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
 }
 
 /* -------------------------------------------------------------- dashboard */
 
 async function loadDashboard() {
+  const generation = sessionGeneration;
   try {
     const data = await api('/api/v1/dashboard');
+    if (!isCurrent(generation)) return;
     const scope = data.scope || 'personal';
     const title = { organization: 'Workforce learning overview', team: 'Team learning overview', personal: 'My learning overview' }[scope];
     const subtitle = {
@@ -228,7 +310,7 @@ async function loadDashboard() {
     body.innerHTML = html;
     hydrate(body);
   } catch (error) {
-    toast(error.message, true);
+    if (isCurrent(generation)) toast(error.message, true);
   }
 }
 
@@ -280,6 +362,7 @@ function courseCard(course) {
 }
 
 async function loadCatalog(query = null) {
+  const generation = sessionGeneration;
   try {
     if (query) state.catalogQuery = query;
     const params = new URLSearchParams();
@@ -288,6 +371,7 @@ async function loadCatalog(query = null) {
     });
     const suffix = params.toString() ? '?' + params.toString() : '';
     state.courses = await api('/api/v1/courses' + suffix);
+    if (!isCurrent(generation)) return;
     const target = $('#courseCards');
     target.innerHTML = state.courses.length
       ? state.courses.map(courseCard).join('')
@@ -300,7 +384,7 @@ async function loadCatalog(query = null) {
         `<option value="${esc(course.course_code)}">${esc(course.course_code)} — ${esc(course.title)}</option>`).join('');
     }
   } catch (error) {
-    toast(error.message, true);
+    if (isCurrent(generation)) toast(error.message, true);
   }
 }
 
@@ -328,25 +412,30 @@ function defaultLessonId(course) {
 }
 
 async function openCourse(code, lessonId = null) {
+  const generation = ++playerGeneration;
   try {
     const course = await api('/api/v1/courses/' + encodeURIComponent(code));
+    if (generation !== playerGeneration) return;
     state.course = course;
     state.lessonId = lessonId || defaultLessonId(course);
     activateView('course');
     renderCourse();
-    await renderPlayer();
+    await renderPlayer(generation);
   } catch (error) {
-    toast(error.message, true);
+    if (generation === playerGeneration) toast(error.message, true);
   }
 }
 
 async function refreshCourse(render = true) {
   if (!state.course) return null;
-  const course = await api('/api/v1/courses/' + encodeURIComponent(state.course.course_code));
+  const generation = ++playerGeneration;
+  const code = state.course.course_code;
+  const course = await api('/api/v1/courses/' + encodeURIComponent(code));
+  if (generation !== playerGeneration) return null;
   state.course = course;
   if (render) {
     renderCourse();
-    await renderPlayer();
+    await renderPlayer(generation);
   }
   return course;
 }
@@ -475,9 +564,14 @@ function playerShell(module, lesson, body, done) {
   </article>`;
 }
 
-async function renderPlayer() {
+async function renderPlayer(generation = null) {
+  const token = generation === null ? ++playerGeneration : generation;
+  if (state.videoRefreshTimer) {
+    clearTimeout(state.videoRefreshTimer);
+    state.videoRefreshTimer = null;
+  }
   const mount = $('#playerMount');
-  if (!mount) return;
+  if (!mount || token !== playerGeneration) return;
   const found = findLesson(state.course, state.lessonId);
   if (!found) {
     mount.innerHTML = '<div class="empty">Select a lesson to begin.</div>';
@@ -497,16 +591,53 @@ async function renderPlayer() {
   } else if (lesson.type === 'video') {
     body = lesson.stream_url
       ? `<video id="lessonVideo" controls preload="metadata" src="${esc(lesson.stream_url)}"></video>`
-      : '<div class="empty">No video attached to this lesson.</div>';
+      : lesson.content
+        ? '<div class="notice">This lesson points to an external video URL. Upload a video file to play it here — external media is blocked by the content security policy.</div>'
+        : '<div class="empty">No video attached to this lesson.</div>';
   } else if (lesson.type === 'link') {
     body = `<p>This lesson opens an external resource.</p>
       <p><a class="button-link" href="${esc(lesson.content)}" target="_blank" rel="noopener noreferrer">Open resource ↗</a></p>`;
   } else if (lesson.type === 'quiz') {
-    await renderQuiz(lesson, module, done);
+    await renderQuiz(lesson, module, done, token);
     return;
   }
+  if (token !== playerGeneration) return;
   mount.innerHTML = playerShell(module, lesson, body, done);
   if (lesson.type === 'video') attachVideoProgress(lesson);
+}
+
+function scheduleVideoRefresh(lesson, video, generation) {
+  let expires = 0;
+  try {
+    expires = Number(new URL(video.src, window.location.href).searchParams.get('exp'));
+  } catch (_) {
+    return;
+  }
+  if (!expires) return;
+  const delay = Math.max(1000, expires * 1000 - Date.now() - 60000);
+  state.videoRefreshTimer = setTimeout(async () => {
+    state.videoRefreshTimer = null;
+    if (generation !== playerGeneration || !video.isConnected || !state.course) return;
+    try {
+      const freshCourse = await api(
+        `/api/v1/courses/${encodeURIComponent(state.course.course_code)}`
+      );
+      const found = findLesson(freshCourse, lesson.id);
+      const fresh = found && found.lesson;
+      if (!fresh || !fresh.stream_url) return;
+      const position = video.currentTime;
+      const wasPlaying = !video.paused && !video.ended;
+      const restore = () => {
+        try { video.currentTime = position; } catch (_) { /* stream not seekable yet */ }
+      };
+      video.addEventListener('loadedmetadata', restore, { once: true });
+      video.src = fresh.stream_url;
+      if (wasPlaying) video.play().catch(() => {});
+      scheduleVideoRefresh(fresh, video, generation);
+    } catch (_) {
+      // A failed refresh leaves the current URL in place; playback may continue.
+    }
+  }, delay);
 }
 
 function attachVideoProgress(lesson) {
@@ -525,12 +656,14 @@ function attachVideoProgress(lesson) {
   video.addEventListener('ended', () => {
     completeLesson(lesson.id).catch((error) => toast(error.message, true));
   });
+  scheduleVideoRefresh(lesson, video, playerGeneration);
 }
 
-async function renderQuiz(lesson, module, done) {
+async function renderQuiz(lesson, module, done, token = playerGeneration) {
   const mount = $('#playerMount');
   try {
     const quiz = await api(`/api/v1/lessons/${lesson.id}/quiz`);
+    if (token !== playerGeneration) return;
     if (!quiz.questions.length) {
       mount.innerHTML = playerShell(module, lesson,
         '<div class="empty">This quiz has no questions yet.</div>', done);
@@ -706,9 +839,9 @@ function openQuestionDialog(question = null) {
 }
 
 async function uploadMedia(file) {
-  const response = await fetch('/api/v1/media', {
+  const response = await rawFetch('/api/v1/media', {
     method: 'POST',
-    headers: { ...authHeaders(), 'Content-Type': file.type, 'X-Filename': file.name },
+    headers: { 'Content-Type': file.type, 'X-Filename': file.name },
     body: file,
   });
   const text = await response.text();
@@ -721,31 +854,26 @@ async function uploadMedia(file) {
 /* --------------------------------------------------------------- learning */
 
 async function learnerOptions() {
-  if (can('manage_people')) {
-    if (!state.employees.length) {
-      const page = await api('/api/v1/employees?limit=500');
-      state.employees = page.items;
-    }
-    return state.employees
-      .filter((employee) => employee.employment_status === 'active')
-      .map((employee) => ({ id: employee.employee_id, name: employee.display_name }));
+  const generation = sessionGeneration;
+  if (!state.employees.length) {
+    const employees = await api('/api/v1/learners');
+    if (!isCurrent(generation)) return [];
+    state.employees = employees;
   }
-  if (can('read_team')) {
-    const team = await api('/api/v1/team');
-    const options = (team.members || []).map((member) => ({ id: member.employee_id, name: member.display_name }));
-    const selfId = state.me.employee_id;
-    if (selfId && !options.some((option) => option.id === selfId)) {
-      options.unshift({ id: selfId, name: (state.me.display_name || selfId) + ' (me)' });
-    }
-    return options;
-  }
-  return [{ id: state.me.employee_id, name: state.me.display_name || state.me.employee_id }];
+  return state.employees.map((employee) => ({
+    id: employee.employee_id,
+    name: employee.employee_id === state.me.employee_id
+      ? (employee.display_name || employee.employee_id) + ' (me)'
+      : employee.display_name || employee.employee_id,
+  }));
 }
 
 async function loadLearning() {
+  const generation = sessionGeneration;
   try {
     const select = $('#learnerSelect');
     const options = await learnerOptions();
+    if (!isCurrent(generation)) return;
     if (!options.length) {
       $('#learningList').innerHTML = '<div class="empty">No learners available.</div>';
       return;
@@ -757,13 +885,15 @@ async function loadLearning() {
     if (previous && options.some((option) => option.id === previous)) select.value = previous;
     const learnerId = select.value || options[0].id;
     const page = await api(`/api/v1/assignments?employee_id=${encodeURIComponent(learnerId)}&limit=200`);
+    if (!isCurrent(generation)) return;
     const items = page.items || [];
     if (!items.length) {
       $('#learningList').innerHTML = '<div class="empty">No assigned learning.</div>';
       return;
     }
     const self = state.me.employee_id === learnerId;
-    const canComplete = self || can('complete_any') || can('complete_team');
+    const canStart = self || canStartAssignment();
+    const canComplete = self || canCompleteAssignment();
     const canManage = can('manage_learning') || can('read_team');
     $('#learningList').innerHTML = items.map((item) => {
       const open = ['assigned', 'in_progress', 'failed'].includes(item.status);
@@ -773,7 +903,7 @@ async function loadLearning() {
       } else if (item.status === 'completed') {
         actions.push(`<button type="button" class="secondary" data-action="open-course" data-course="${esc(item.course_code)}">Review course</button>`);
       }
-      if (open && canComplete && item.status === 'assigned') {
+      if (open && canStart && item.status === 'assigned') {
         actions.push(`<button type="button" class="secondary" data-action="start" data-employee="${esc(item.employee_id)}" data-course="${esc(item.course_code)}">Start</button>`);
       }
       if (open && canComplete) {
@@ -801,18 +931,20 @@ async function loadLearning() {
         `</article>`;
     }).join('');
   } catch (error) {
-    toast(error.message, true);
+    if (isCurrent(generation)) toast(error.message, true);
   }
 }
 
 /* ------------------------------------------------------------------- team */
 
 async function loadTeam() {
+  const generation = sessionGeneration;
   try {
     const [team, assignments] = await Promise.all([
       api('/api/v1/team'),
       api('/api/v1/team/assignments?limit=200'),
     ]);
+    if (!isCurrent(generation)) return;
     const body = $('#teamBody');
     let html = kpis([
       ['Team members', team.team_size],
@@ -835,18 +967,20 @@ async function loadTeam() {
     body.innerHTML = html;
     hydrate(body);
   } catch (error) {
-    toast(error.message, true);
+    if (isCurrent(generation)) toast(error.message, true);
   }
 }
 
 /* ----------------------------------------------------------------- people */
 
 async function loadPeople(query = {}) {
+  const generation = sessionGeneration;
   try {
     const params = new URLSearchParams();
     Object.entries(query).forEach(([key, value]) => { if (value) params.set(key, value); });
     params.set('limit', '200');
     const page = await api('/api/v1/employees?' + params.toString());
+    if (!isCurrent(generation)) return;
     state.employees = page.items;
     $('#peopleRows').innerHTML = page.items.map((employee) => `<tr>` +
       `<td><strong>${esc(employee.display_name)}</strong><br><small>${esc(employee.employee_id)} · ${esc(employee.work_email || '')}</small></td>` +
@@ -858,16 +992,19 @@ async function loadPeople(query = {}) {
       `</tr>`).join('');
     $('#peopleMeta').textContent = `${page.total} employee(s) · showing ${page.items.length}`;
   } catch (error) {
-    toast(error.message, true);
+    if (isCurrent(generation)) toast(error.message, true);
   }
 }
 
 /* --------------------------------------------------------------- policies */
 
 async function loadPolicies() {
+  const generation = sessionGeneration;
   try {
     const policies = await api('/api/v1/policies');
+    if (!isCurrent(generation)) return;
     if (!state.courses.length) await loadCatalog();
+    if (!isCurrent(generation)) return;
     $('#policyRows').innerHTML = policies.map((policy) => `<tr>` +
       `<td>${esc(policy.name)}</td>` +
       `<td>${esc(policy.course_code)}<br><small>${esc(policy.course_title)}</small></td>` +
@@ -876,15 +1013,19 @@ async function loadPolicies() {
       `<td>${statusTag(policy.active ? 'active' : 'inactive')}</td>` +
       `</tr>`).join('');
   } catch (error) {
-    toast(error.message, true);
+    if (isCurrent(generation)) toast(error.message, true);
   }
 }
 
 /* ---------------------------------------------------------- notifications */
 
 async function loadNotifications() {
+  const generation = sessionGeneration;
   try {
     const page = await api('/api/v1/notifications?limit=100');
+    const me = await api('/api/v1/me');
+    if (!isCurrent(generation)) return;
+    updateBell(me.unread_notifications || 0);
     const items = page.items || [];
     $('#notificationList').innerHTML = items.length ? items.map((item) => `<article class="card ${item.read_at ? 'muted-card' : ''}">` +
       `<div class="meta"><span class="tag">${esc(item.template)}</span>` +
@@ -893,10 +1034,8 @@ async function loadNotifications() {
       `<h3>${esc(item.subject)}</h3><p class="prewrap">${esc(item.body)}</p>` +
       (item.read_at ? '' : `<div class="actions"><button type="button" class="secondary" data-action="mark-read" data-id="${esc(item.id)}">Mark read</button></div>`) +
       `</article>`).join('') : '<div class="empty">No notifications.</div>';
-    const unread = items.filter((item) => !item.read_at).length;
-    updateBell(unread);
   } catch (error) {
-    toast(error.message, true);
+    if (isCurrent(generation)) toast(error.message, true);
   }
 }
 
@@ -911,17 +1050,30 @@ function importBody() {
   };
 }
 
+function invalidateImport(reason) {
+  state.importSnapshot = null;
+  $('#applyImport').disabled = true;
+  if (reason) $('#importSummary').textContent = reason;
+}
+
 async function readCsv() {
+  const generation = sessionGeneration;
   const file = $('#csvFile').files[0];
   if (!file) throw new Error('Select a CSV file');
-  state.csvText = await file.text();
+  const csvText = await file.text();
+  if (!isCurrent(generation)) return false;
+  state.csvText = csvText;
   state.csvName = file.name;
+  return true;
 }
 
 async function analyzeImport() {
+  const generation = sessionGeneration;
   try {
-    await readCsv();
-    const result = await api('/api/v1/hris/analyze', { method: 'POST', body: JSON.stringify(importBody()) });
+    if (!await readCsv() || !isCurrent(generation)) return;
+    const body = importBody();
+    const result = await api('/api/v1/hris/analyze', { method: 'POST', body: JSON.stringify(body) });
+    if (!isCurrent(generation)) return;
     const warnings = (result.warnings || []).length
       ? `<details><summary>Warnings</summary><code>${esc(JSON.stringify(result.warnings, null, 2))}</code></details>` : '';
     $('#importSummary').innerHTML =
@@ -935,43 +1087,62 @@ async function analyzeImport() {
       (result.errors.length ? `<details><summary>Validation issues</summary><code>${esc(JSON.stringify(result.errors, null, 2))}</code></details>` : '') +
       warnings;
     $('#applyImport').disabled = !result.can_apply;
+    state.importSnapshot = result.can_apply
+      ? { body: JSON.stringify(body), summary: $('#importSummary').innerHTML }
+      : null;
     toast('Dry run complete');
   } catch (error) {
-    toast(error.message, true);
+    if (isCurrent(generation)) toast(error.message, true);
   }
 }
 
 async function applyImport() {
+  const generation = sessionGeneration;
+  if (!state.importSnapshot) {
+    toast('Analyze the current file before applying it', true);
+    return;
+  }
+  const body = JSON.stringify(importBody());
+  if (body !== state.importSnapshot.body) {
+    invalidateImport('The extract or its options changed after analysis. Analyze it again.');
+    toast('The reviewed import changed — analyze it again', true);
+    return;
+  }
   if (!window.confirm('Apply this employee extract? Account, role, and assignment changes will be audited.')) return;
   try {
-    const result = await api('/api/v1/hris/apply', { method: 'POST', body: JSON.stringify(importBody()) });
+    const result = await api('/api/v1/hris/apply', { method: 'POST', body });
+    if (!isCurrent(generation)) return;
     toast(result.status === 'duplicate' ? 'This extract was already applied' : 'Import applied');
     $('#applyImport').disabled = true;
     await Promise.all([loadImportJobs(), loadDashboard()]);
   } catch (error) {
-    toast(error.message, true);
+    if (isCurrent(generation)) toast(error.message, true);
   }
 }
 
 async function loadImportJobs() {
+  const generation = sessionGeneration;
   try {
     const jobs = await api('/api/v1/import-jobs');
+    if (!isCurrent(generation)) return;
     $('#importRows').innerHTML = jobs.map((job) => `<tr>` +
       `<td>#${esc(job.id)}</td><td>${esc(job.filename)}</td><td>${statusTag(job.status)}</td>` +
       `<td>${esc(job.row_count)}</td><td>${esc(job.create_count)}</td>` +
       `<td>${esc(job.update_count)}</td><td>${esc(job.suspend_count)}</td></tr>`).join('');
   } catch (error) {
-    toast(error.message, true);
+    if (isCurrent(generation)) toast(error.message, true);
   }
 }
 
 /* ------------------------------------------------------------------ audit */
 
 async function loadAudit(query = {}) {
+  const generation = sessionGeneration;
   try {
     const params = new URLSearchParams({ limit: '100' });
     Object.entries(query).forEach(([key, value]) => { if (value) params.set(key, value); });
     const page = await api('/api/v1/audit?' + params.toString());
+    if (!isCurrent(generation)) return;
     $('#auditRows').innerHTML = page.items.map((event) => `<tr>` +
       `<td>${esc((event.created_at || '').slice(0, 19).replace('T', ' '))}</td>` +
       `<td>${esc(event.event_type)}</td><td>${esc(event.actor)}</td>` +
@@ -979,8 +1150,354 @@ async function loadAudit(query = {}) {
       `<td><code>${esc(JSON.stringify(event.details))}</code></td></tr>`).join('');
     $('#auditMeta').textContent = `${page.total} event(s) · showing ${page.items.length}`;
   } catch (error) {
-    toast(error.message, true);
+    if (isCurrent(generation)) toast(error.message, true);
   }
+}
+
+/* ------------------------------------------------------------- engagement */
+
+function badgeGlyph(icon) {
+  return { star: '★', shield: '◆', trophy: '♛', certificate: '✜', bolt: '⚡', book: '▣' }[icon] || '★';
+}
+
+function pathCard(path) {
+  const progress = path.my_progress || {};
+  const actions = `<button type="button" data-action="open-path" data-path="${esc(path.id)}">View path</button>` +
+    (progress.next_course
+      ? `<button type="button" class="secondary" data-action="enroll-path" data-path="${esc(path.id)}">Start next course</button>`
+      : '') +
+    (canManagePaths()
+      ? `<button type="button" class="icon danger" data-action="delete-path" data-path="${esc(path.id)}">Delete</button>`
+      : '');
+  return `<article class="card">
+    <div class="meta">${statusTag(path.status)}<span class="tag">${esc(path.course_count)} courses</span>
+      <span class="tag">${esc(path.content_minutes)} min</span></div>
+    <h3>${esc(path.title)}</h3>
+    <p>${esc(path.description || 'A guided sequence of courses.')}</p>
+    <small>${esc(path.code)}</small>
+    ${progress.required_courses ? progressBar(progress.percent, `${progress.completed_required}/${progress.required_courses} required`) : ''}
+    <div class="actions">${actions}</div>
+  </article>`;
+}
+
+async function loadPaths() {
+  const generation = sessionGeneration;
+  try {
+    state.paths = await api('/api/v1/learning-paths');
+    if (!isCurrent(generation)) return;
+    const host = $('#pathCards');
+    host.innerHTML = state.paths.length ? state.paths.map(pathCard).join('')
+      : '<div class="empty">No learning paths are published yet.</div>';
+    hydrate(host);
+    $('#pathDetail').hidden = true;
+  } catch (error) {
+    if (isCurrent(generation)) toast(error.message, true);
+  }
+}
+
+async function openPathDetail(pathId) {
+  const generation = sessionGeneration;
+  try {
+    const path = await api('/api/v1/learning-paths/' + encodeURIComponent(pathId));
+    if (!isCurrent(generation)) return;
+    const steps = (path.courses || []).map((course, index) => {
+      const assignment = course.assignment;
+      const grade = course.grade || {};
+      const done = assignment && ['completed', 'exempted'].includes(assignment.status);
+      const action = assignment
+        ? `<button type="button" class="small" data-action="open-course" data-course="${esc(course.course_code)}">Open course</button>`
+        : `<button type="button" class="small" data-action="enroll-direct" data-course="${esc(course.course_code)}">Enroll</button>`;
+      return `<li class="${done ? 'done' : ''}">
+        <strong>${index + 1}. ${esc(course.title)}</strong><br>
+        <small>${esc(course.course_code)} · ${esc(course.duration_minutes)} min · ${course.is_required ? 'Required' : 'Optional'}</small>
+        <div class="meta">${assignment ? statusTag(assignment.status) : '<span class="tag">Not assigned</span>'}
+          ${grade.score !== null && grade.score !== undefined ? `<span class="tag">${esc(grade.score)}% · ${esc(grade.letter)}</span>` : ''}</div>
+        <div class="step-actions">${action}
+          ${canManagePaths() ? `<button type="button" class="icon danger" data-action="remove-path-course" data-path="${esc(path.id)}" data-course="${esc(course.course_code)}">Remove</button>` : ''}
+        </div>
+      </li>`;
+    }).join('') || '<li class="muted small">No courses in this path.</li>';
+    let addCourse = '';
+    if (canManagePaths()) {
+      if (!state.courses.length) await loadCatalog();
+      if (!isCurrent(generation)) return;
+      addCourse = `<form class="inline-form" data-form="pathCourse">
+        <input type="hidden" name="path_id" value="${esc(path.id)}">
+        <label>Course<select name="course_code" required>${state.courses.map((item) =>
+          `<option value="${esc(item.course_code)}">${esc(item.course_code)} — ${esc(item.title)}</option>`).join('')}</select></label>
+        <button type="submit">Add course</button>
+      </form>`;
+    }
+    const detail = $('#pathDetail');
+    detail.innerHTML = `<article class="card">
+      <div class="meta">${statusTag(path.status)}<span class="tag">${esc(path.code)}</span></div>
+      <h2>${esc(path.title)}</h2><p>${esc(path.description || '')}</p>
+      ${path.progress ? progressBar(path.progress.percent, `${path.progress.completed_required}/${path.progress.required_courses} required`) : ''}
+      <ol class="path-steps">${steps}</ol>${addCourse}
+      <div class="detail-actions"><button type="button" class="secondary" data-action="refresh-paths">Back to paths</button></div>
+    </article>`;
+    detail.hidden = false;
+  } catch (error) {
+    if (isCurrent(generation)) toast(error.message, true);
+  }
+}
+
+async function loadGradebook() {
+  const generation = sessionGeneration;
+  try {
+    const options = await learnerOptions();
+    if (!isCurrent(generation)) return;
+    const select = $('#gradebookLearner');
+    const previous = select.value;
+    select.innerHTML = options.map((item) =>
+      `<option value="${esc(item.id)}">${esc(item.name)}</option>`).join('');
+    select.disabled = options.length === 1;
+    if (previous && options.some((item) => item.id === previous)) select.value = previous;
+    const learnerId = select.value || options[0].id;
+    const data = await api('/api/v1/gradebook?employee_id=' + encodeURIComponent(learnerId));
+    if (!isCurrent(generation)) return;
+    state.gradebook = data;
+    const gradeRows = (data.grades || []).map((grade) => [
+      `<strong>${esc(grade.course_title)}</strong><br><small>${esc(grade.course_code)}</small>`,
+      statusTag(grade.status),
+      `<span class="grade-score">${grade.score === null ? '—' : esc(grade.score) + '%'}</span> <span class="tag">${esc(grade.letter)}</span>`,
+      `${esc(grade.components.length)} quiz component(s)`,
+      esc(grade.source),
+    ]);
+    const grades = table(['Course', 'Status', 'Final grade', 'Evidence', 'Source'], gradeRows);
+    const badgeRows = (data.badges || []).map((badge) => [
+      `<span class="badge-icon">${esc(badgeGlyph(badge.icon))}</span><strong>${esc(badge.title)}</strong>`,
+      esc(badge.source),
+      esc((badge.awarded_at || '').slice(0, 16).replace('T', ' ')),
+      `<code class="credential-code">${esc(badge.verification_code)}</code>`,
+    ]);
+    const badges = table(['Credential', 'Source', 'Awarded', 'Verification code'], badgeRows);
+    const pathRows = (data.paths || []).map((path) => [
+      esc(path.title), esc(path.course_count), progressBar(path.my_progress?.percent || 0, `${path.my_progress?.completed_required || 0}/${path.my_progress?.required_courses || 0}`),
+      path.my_progress?.next_course ? `<span class="tag amber">${esc(path.my_progress.next_course)}</span>` : '<span class="tag green">Complete</span>',
+    ]);
+    $('#gradebookBody').innerHTML = `<article><h2>Course grades</h2>${grades}</article>
+      <article><h2>Earned credentials</h2>${badges}</article>
+      <article><h2>Learning paths</h2>${table(['Path', 'Courses', 'Progress', 'Next'], pathRows)}</article>`;
+    $('#gradebookMeta').textContent = `${data.grades.length} course grade(s) · ${data.badges.length} credential(s)`;
+  } catch (error) {
+    if (isCurrent(generation)) toast(error.message, true);
+  }
+}
+
+async function loadCredentials() {
+  const generation = sessionGeneration;
+  try {
+    const suffix = can('manage_learning') ? '?include_inactive=true' : '';
+    const [badges, earned] = await Promise.all([
+      api('/api/v1/badges' + suffix),
+      api('/api/v1/credentials/earned'),
+    ]);
+    if (!isCurrent(generation)) return;
+    state.badges = badges;
+    if (!state.courses.length) await loadCatalog();
+    if (!isCurrent(generation)) return;
+    const paths = await api('/api/v1/learning-paths');
+    if (!isCurrent(generation)) return;
+    const courseSelect = $('#badgeDialog form [name=criteria_course_code]');
+    const pathSelect = $('#badgeDialog form [name=criteria_path_id]');
+    courseSelect.innerHTML = '<option value="">Manual award</option>' + state.courses.map((course) =>
+      `<option value="${esc(course.course_code)}">${esc(course.course_code)} — ${esc(course.title)}</option>`).join('');
+    pathSelect.innerHTML = '<option value="">None</option>' + paths.map((path) =>
+      `<option value="${esc(path.id)}">${esc(path.title)}</option>`).join('');
+
+    const host = $('#credentialCards');
+    host.innerHTML = badges.map((badge) => {
+      const award = earned.find((item) => Number(item.badge_id) === Number(badge.id));
+      const awardForm = can('manage_learning')
+        ? `<form class="inline-form" data-form="award"><input type="hidden" name="badge_id" value="${esc(badge.id)}">
+             <label>Award to<input name="employee_id" placeholder="E1003" required></label>
+             <button type="submit">Award manually</button></form>`
+        : '';
+      return `<article class="card">
+        <div class="meta"><span class="badge-icon">${esc(badgeGlyph(badge.icon))}</span>
+          <span class="tag">${esc(badge.criteria_title)}</span>
+          ${award ? '<span class="tag green">Earned</span>' : ''}</div>
+        <h3>${esc(badge.title)}</h3><p>${esc(badge.description || '')}</p>
+        <small>${esc(badge.code)} · ${esc(badge.award_count)} awarded</small>
+        ${award ? `<p><code class="credential-code">${esc(award.verification_code)}</code></p>` : ''}
+        ${awardForm}
+      </article>`;
+    }).join('') || '<div class="empty">No badges have been defined yet.</div>';
+  } catch (error) {
+    if (isCurrent(generation)) toast(error.message, true);
+  }
+}
+
+async function loadCohorts() {
+  const generation = sessionGeneration;
+  try {
+    state.cohorts = await api('/api/v1/cohorts');
+    if (!isCurrent(generation)) return;
+    $('#cohortCards').innerHTML = state.cohorts.length ? state.cohorts.map((cohort) =>
+      `<article class="card">
+        <div class="meta">${statusTag(cohort.active ? 'active' : 'inactive')}
+          <span class="tag">${esc(cohort.member_count)} members</span></div>
+        <h3>${esc(cohort.name)}</h3><p>${esc(cohort.description || '')}</p>
+        <small>${esc(cohort.code)}</small>
+        <div class="actions"><button type="button" data-action="open-cohort" data-cohort="${esc(cohort.id)}">Manage members</button></div>
+      </article>`).join('') : '<div class="empty">No cohorts yet.</div>';
+    $('#cohortDetail').hidden = true;
+  } catch (error) {
+    if (isCurrent(generation)) toast(error.message, true);
+  }
+}
+
+async function openCohortDetail(cohortId) {
+  const generation = sessionGeneration;
+  try {
+    const cohort = await api('/api/v1/cohorts/' + encodeURIComponent(cohortId));
+    if (!isCurrent(generation)) return;
+    if (!state.employees.length) {
+      const employees = await api('/api/v1/learners');
+      if (!isCurrent(generation)) return;
+      state.employees = employees;
+    }
+    const members = table(['Employee', 'Department', 'Status', 'Added by', ''],
+      (cohort.members || []).map((member) => [
+        `<strong>${esc(member.display_name)}</strong><br><small>${esc(member.employee_id)}</small>`,
+        esc(member.department || '—'), statusTag(member.employment_status || 'active'),
+        esc(member.added_by || '—'),
+        `<button type="button" class="icon danger" data-action="remove-cohort-member" data-cohort="${esc(cohort.id)}" data-employee="${esc(member.employee_id)}">Remove</button>`,
+      ]));
+    const detail = $('#cohortDetail');
+    detail.innerHTML = `<article class="card">
+      <div class="meta">${statusTag(cohort.active ? 'active' : 'inactive')}<span class="tag">${esc(cohort.code)}</span></div>
+      <h2>${esc(cohort.name)}</h2><p>${esc(cohort.description || '')}</p>
+      ${members}
+      <form class="inline-form" data-form="cohortMember">
+        <input type="hidden" name="cohort_id" value="${esc(cohort.id)}">
+        <label>Employee<select name="employee_id" required>${state.employees.map((employee) =>
+          `<option value="${esc(employee.employee_id)}">${esc(employee.display_name)} · ${esc(employee.employee_id)}</option>`).join('')}</select></label>
+        <button type="submit">Add member</button>
+      </form>
+      <div class="detail-actions"><button type="button" class="secondary" data-action="refresh-cohorts">Back to cohorts</button></div>
+    </article>`;
+    detail.hidden = false;
+  } catch (error) {
+    if (isCurrent(generation)) toast(error.message, true);
+  }
+}
+
+async function loadDiscussions() {
+  const generation = sessionGeneration;
+  try {
+    if (!state.courses.length) {
+      await loadCatalog();
+      if (!isCurrent(generation)) return;
+    }
+    let courses = state.courses;
+    if (!(can('manage_content') || can('manage_learning'))) {
+      const page = await api('/api/v1/assignments?employee_id=' +
+        encodeURIComponent(state.me.employee_id) + '&limit=200');
+      if (!isCurrent(generation)) return;
+      const enrolled = new Set((page.items || []).map((item) => item.course_code));
+      courses = courses.filter((course) => enrolled.has(course.course_code));
+    }
+    const select = $('#discussionCourse');
+    const previous = select.value;
+    select.innerHTML = courses.map((course) =>
+      `<option value="${esc(course.course_code)}">${esc(course.course_code)} — ${esc(course.title)}</option>`).join('');
+    const newButton = $('#newDiscussion');
+    if (newButton) newButton.hidden = !courses.length;
+    if (!courses.length) {
+      $('#discussionList').innerHTML = '<div class="empty">No course discussions available.</div>';
+      $('#discussionDetail').hidden = true;
+      return;
+    }
+    if (previous && courses.some((course) => course.course_code === previous)) select.value = previous;
+    const code = select.value || courses[0].course_code;
+    state.discussions = await api('/api/v1/courses/' + encodeURIComponent(code) + '/discussions');
+    if (!isCurrent(generation)) return;
+    $('#discussionList').innerHTML = state.discussions.length ? state.discussions.map((item) =>
+      `<article class="card">
+        <div class="meta">${item.pinned ? '<span class="tag amber">Pinned</span>' : ''}
+          <span class="tag">${esc(item.post_count)} posts</span>
+          <span class="tag">${esc(item.author_name || item.created_by)}</span></div>
+        <h3>${esc(item.title)}</h3><p class="prewrap">${esc(item.body || '')}</p>
+        <small>${esc((item.last_post_at || item.updated_at || '').slice(0, 16).replace('T', ' '))}</small>
+        <div class="actions"><button type="button" data-action="open-discussion" data-discussion="${esc(item.id)}">Open thread</button></div>
+      </article>`).join('') : '<div class="empty">No discussions for this course yet.</div>';
+    $('#discussionDetail').hidden = true;
+  } catch (error) {
+    if (isCurrent(generation)) toast(error.message, true);
+  }
+}
+
+async function openDiscussionDetail(discussionId) {
+  const generation = sessionGeneration;
+  try {
+    const item = await api('/api/v1/discussions/' + encodeURIComponent(discussionId));
+    if (!isCurrent(generation)) return;
+    const posts = (item.posts || []).map((post) => `<div class="discussion-post">
+      <div class="post-head"><strong>${esc(post.author_name || post.author_id)}</strong>
+        <small>${esc((post.created_at || '').slice(0, 16).replace('T', ' '))}</small>
+        ${post.edited_at ? '<span class="tag">Edited</span>' : ''}</div>
+      <p class="prewrap">${esc(post.body)}</p>
+      <div class="detail-actions">
+        <button type="button" class="small" data-action="reply-discussion" data-discussion="${esc(item.id)}" data-parent="${esc(post.id)}">Reply</button>
+        ${can('manage_content') || post.author_id === state.me.employee_id
+          ? `<button type="button" class="icon danger" data-action="delete-post" data-discussion="${esc(item.id)}" data-post="${esc(post.id)}">Delete</button>` : ''}
+      </div>
+    </div>`).join('') || '<div class="empty">No replies yet.</div>';
+    const detail = $('#discussionDetail');
+    detail.innerHTML = `<article class="card">
+      <div class="meta">${item.pinned ? '<span class="tag amber">Pinned</span>' : ''}
+        ${item.closed ? '<span class="tag red">Closed</span>' : ''}
+        <span class="tag">${esc(item.course_code)}</span></div>
+      <h2>${esc(item.title)}</h2><p class="prewrap">${esc(item.body || '')}</p>
+      ${posts}
+      ${item.closed ? '' : `<div class="detail-actions"><button type="button" data-action="reply-discussion" data-discussion="${esc(item.id)}">Add a reply</button></div>`}
+      ${can('manage_content') || item.created_by === state.me.employee_id
+        ? `<div class="detail-actions"><button type="button" class="icon danger" data-action="delete-discussion" data-discussion="${esc(item.id)}">Delete discussion</button></div>` : ''}
+    </article>`;
+    detail.hidden = false;
+    detail.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch (error) {
+    if (isCurrent(generation)) toast(error.message, true);
+  }
+}
+
+function openCohortDialog(cohort = null) {
+  const form = $('#cohortDialog form');
+  form.reset();
+  form.cohort_id.value = cohort ? cohort.id : '';
+  $('#cohortDialogTitle').textContent = cohort ? 'Edit cohort' : 'New cohort';
+  if (cohort) {
+    setForm(form, { code: cohort.code, name: cohort.name, description: cohort.description, active: cohort.active });
+    form.employees.value = '';
+  }
+  openDialog('cohortDialog');
+}
+
+function openPathDialog(path = null) {
+  const form = $('#pathDialog form');
+  form.reset();
+  form.path_id.value = path ? path.id : '';
+  $('#pathDialogTitle').textContent = path ? 'Edit path' : 'New learning path';
+  if (path) setForm(form, {
+    code: path.code, title: path.title, description: path.description, status: path.status,
+    courses: (path.courses || []).map((course) => course.course_code).join('\n'),
+  });
+  openDialog('pathDialog');
+}
+
+function openBadgeDialog(badge = null) {
+  const form = $('#badgeDialog form');
+  form.reset();
+  form.badge_id.value = badge ? badge.id : '';
+  $('#badgeDialogTitle').textContent = badge ? 'Edit badge' : 'New badge';
+  if (badge) setForm(form, {
+    code: badge.code, title: badge.title, description: badge.description, icon: badge.icon,
+    criteria_course_code: badge.criteria_course_code || '',
+    criteria_path_id: badge.criteria_path_id || '', active: badge.active,
+  });
+  openDialog('badgeDialog');
 }
 
 /* ------------------------------------------------------------------ views */
@@ -990,6 +1507,11 @@ const VIEW_LOADERS = {
   catalog: () => loadCatalog(),
   course: () => (state.course ? openCourse(state.course.course_code, state.lessonId) : showView('catalog')),
   learning: loadLearning,
+  paths: loadPaths,
+  gradebook: loadGradebook,
+  credentials: loadCredentials,
+  cohorts: loadCohorts,
+  discussions: loadDiscussions,
   team: loadTeam,
   people: () => loadPeople(),
   policies: loadPolicies,
@@ -998,23 +1520,60 @@ const VIEW_LOADERS = {
   audit: () => loadAudit(),
 };
 
-function activateView(name) {
+function activateView(name, push = true) {
   state.view = name;
-  $$('nav button').forEach((item) => item.classList.toggle('active', item.dataset.view === name));
+  $$('nav button').forEach((item) => {
+    const active = item.dataset.view === name;
+    item.classList.toggle('active', active);
+    if (active) item.setAttribute('aria-current', 'page');
+    else item.removeAttribute('aria-current');
+  });
   $$('.view').forEach((section) => section.classList.toggle('active', section.id === name));
+  if (push) {
+    const hash = name === 'course' && state.course
+      ? '#/course/' + encodeURIComponent(state.course.course_code)
+      : '#/' + name;
+    if (location.hash !== hash) history.pushState(null, '', hash);
+    lastRouteHash = hash;
+  }
 }
 
-function showView(name) {
+function showView(name, push = true) {
   const button = $(`nav button[data-view="${name}"]`);
-  if (button && button.hidden) name = 'dashboard';
-  activateView(name);
+  if (button && button.hidden) {
+    name = 'dashboard';
+    push = true;
+  }
+  activateView(name, push);
   return loadView(name);
 }
 
 async function loadView(name) {
+  const generation = sessionGeneration;
   const loader = VIEW_LOADERS[name];
   if (loader) await loader();
+  if (!isCurrent(generation)) return;
 }
+
+function routeFromHash(force = false) {
+  const hash = location.hash;
+  if (!force && hash === lastRouteHash) return;
+  lastRouteHash = hash;
+  const raw = hash.replace(/^#\/?/, '');
+  if (!raw || raw === 'main') return;
+  const [kind, value] = raw.split('/');
+  if (kind === 'course' && value) {
+    openCourse(decodeURIComponent(value));
+    return;
+  }
+  const button = $(`nav button[data-view="${kind}"]`);
+  const target = button && !button.hidden ? kind : 'dashboard';
+  lastRouteHash = '#/' + target;
+  showView(target, false);
+}
+
+window.addEventListener('popstate', () => routeFromHash(true));
+window.addEventListener('hashchange', () => routeFromHash(true));
 
 /* ---------------------------------------------------------------- actions */
 
@@ -1046,7 +1605,7 @@ function assignmentDialog(id, employeeId, courseCode, title) {
 
 async function exportCsv() {
   try {
-    const response = await fetch('/api/v1/reports/compliance.csv', { headers: authHeaders() });
+    const response = await rawFetch('/api/v1/reports/compliance.csv');
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
       throw new Error(data.message || 'Export failed');
@@ -1077,7 +1636,16 @@ document.addEventListener('click', async (event) => {
     } else if (action === 'show-notifications') {
       await showView('notifications');
     } else if (action === 'open-dialog') {
-      openDialog(target.dataset.dialog);
+      const dialog = target.dataset.dialog;
+      if (dialog === 'cohortDialog') openCohortDialog(null);
+      else if (dialog === 'pathDialog') openPathDialog(null);
+      else if (dialog === 'badgeDialog') openBadgeDialog(null);
+      else if (dialog === 'discussionDialog') {
+        const form = $('#discussionDialog form');
+        form.reset();
+        form.course_code.value = $('#discussionCourse').value || '';
+        openDialog('discussionDialog');
+      } else openDialog(dialog);
     } else if (action === 'close-dialog') {
       closeDialog(target.dataset.dialog);
     } else if (action === 'refresh-dashboard') {
@@ -1149,6 +1717,70 @@ document.addEventListener('click', async (event) => {
       toast('Question deleted');
       await refreshCourse(false);
       await openQuestionManager(state.questionLesson);
+    } else if (action === 'refresh-paths') {
+      await loadPaths();
+    } else if (action === 'open-path') {
+      await openPathDetail(target.dataset.path);
+    } else if (action === 'enroll-path') {
+      await api(`/api/v1/learning-paths/${target.dataset.path}/enroll`, {
+        method: 'POST', body: '{}',
+      });
+      toast('Next course added to your learning');
+      await openPathDetail(target.dataset.path);
+    } else if (action === 'enroll-direct') {
+      await api(`/api/v1/courses/${encodeURIComponent(target.dataset.course)}/enroll`, {
+        method: 'POST', body: '{}',
+      });
+      toast('Enrolled in course');
+      await loadPaths();
+      await loadGradebook();
+    } else if (action === 'delete-path') {
+      if (!window.confirm('Delete this learning path?')) return;
+      await api(`/api/v1/learning-paths/${target.dataset.path}`, { method: 'DELETE', body: '{}' });
+      toast('Learning path deleted');
+      await loadPaths();
+    } else if (action === 'remove-path-course') {
+      await api(`/api/v1/learning-paths/${target.dataset.path}/courses/${encodeURIComponent(target.dataset.course)}`, {
+        method: 'DELETE', body: '{}',
+      });
+      toast('Course removed from path');
+      await openPathDetail(target.dataset.path);
+    } else if (action === 'refresh-cohorts') {
+      await loadCohorts();
+    } else if (action === 'open-cohort') {
+      await openCohortDetail(target.dataset.cohort);
+    } else if (action === 'remove-cohort-member') {
+      await api(`/api/v1/cohorts/${target.dataset.cohort}/members/${encodeURIComponent(target.dataset.employee)}`, {
+        method: 'DELETE', body: '{}',
+      });
+      toast('Member removed');
+      await openCohortDetail(target.dataset.cohort);
+    } else if (action === 'delete-cohort') {
+      if (!window.confirm('Delete this cohort?')) return;
+      await api(`/api/v1/cohorts/${target.dataset.cohort}`, { method: 'DELETE', body: '{}' });
+      toast('Cohort deleted');
+      await loadCohorts();
+    } else if (action === 'open-discussion') {
+      await openDiscussionDetail(target.dataset.discussion);
+    } else if (action === 'reply-discussion') {
+      const form = $('#postDialog form');
+      form.reset();
+      form.discussion_id.value = target.dataset.discussion;
+      form.parent_id.value = target.dataset.parent || '';
+      $('#postDialogTitle').textContent = target.dataset.parent ? 'Reply to post' : 'Add a reply';
+      openDialog('postDialog');
+    } else if (action === 'delete-discussion') {
+      if (!window.confirm('Delete this discussion and its replies?')) return;
+      await api(`/api/v1/discussions/${target.dataset.discussion}`, { method: 'DELETE', body: '{}' });
+      toast('Discussion deleted');
+      await loadDiscussions();
+    } else if (action === 'delete-post') {
+      if (!window.confirm('Delete this reply?')) return;
+      await api(`/api/v1/discussions/${target.dataset.discussion}/posts/${target.dataset.post}`, {
+        method: 'DELETE', body: '{}',
+      });
+      toast('Reply deleted');
+      await openDiscussionDetail(target.dataset.discussion);
     } else if (action === 'start') {
       await api('/api/v1/assignments/start', {
         method: 'POST',
@@ -1214,6 +1846,10 @@ document.addEventListener('change', async (event) => {
       toast('Video uploaded');
     } else if (target.id === 'lessonType') {
       syncLessonFields();
+    } else if (target.id === 'csvFile') {
+      invalidateImport('The selected file changed. Analyze it again before applying.');
+    } else if (target.id === 'importMode' || target.id === 'threshold') {
+      invalidateImport('The import options changed. Analyze it again before applying.');
     }
   } catch (error) {
     toast(error.message, true);
@@ -1236,7 +1872,8 @@ document.addEventListener('submit', async (event) => {
       const data = formData(form);
       const original = data.original_code;
       const payload = {
-        course_code: data.course_code, title: data.title, category: data.category,
+        course_code: data.original_code || data.course_code,
+        title: data.title, category: data.category,
         level: data.level, language: data.language, author: data.author,
         duration_minutes: Number(data.duration_minutes || 30),
         version: data.version,
@@ -1284,7 +1921,7 @@ document.addEventListener('submit', async (event) => {
         lesson_type: type,
         duration_minutes: Number(data.duration_minutes || 0),
         is_required: Boolean(data.is_required),
-        quiz_pass_score: Number(data.quiz_pass_score || 70),
+        quiz_pass_score: data.quiz_pass_score === '' ? 70 : Number(data.quiz_pass_score),
       };
       if (type === 'text' || type === 'quiz') payload.content = data.content;
       else if (type === 'youtube' || type === 'link') payload.content = data.url_content;
@@ -1369,6 +2006,90 @@ document.addEventListener('submit', async (event) => {
       closeDialog('extendDialog');
       toast('Due date extended');
       await loadLearning();
+    } else if (kind === 'cohort') {
+      const data = formData(form);
+      const payload = {
+        code: data.code, name: data.name, description: data.description,
+        active: Boolean(data.active),
+        employees: String(data.employees || '').split('\n').map((line) => line.trim()).filter(Boolean),
+      };
+      if (data.cohort_id) {
+        await api('/api/v1/cohorts/' + data.cohort_id, { method: 'PATCH', body: JSON.stringify(payload) });
+      } else {
+        await api('/api/v1/cohorts', { method: 'POST', body: JSON.stringify(payload) });
+      }
+      closeDialog('cohortDialog');
+      toast('Cohort saved');
+      await loadCohorts();
+    } else if (kind === 'path') {
+      const data = formData(form);
+      const payload = {
+        code: data.code, title: data.title, description: data.description,
+        status: data.status,
+        courses: String(data.courses || '').split('\n').map((line) => line.trim()).filter(Boolean),
+      };
+      if (data.path_id) {
+        await api('/api/v1/learning-paths/' + data.path_id, { method: 'PATCH', body: JSON.stringify(payload) });
+      } else {
+        await api('/api/v1/learning-paths', { method: 'POST', body: JSON.stringify(payload) });
+      }
+      closeDialog('pathDialog');
+      toast('Learning path saved');
+      await loadPaths();
+    } else if (kind === 'badge') {
+      const data = formData(form);
+      const payload = {
+        code: data.code, title: data.title, description: data.description,
+        icon: data.icon, criteria_course_code: data.criteria_course_code,
+        criteria_path_id: data.criteria_path_id, active: Boolean(data.active),
+      };
+      if (data.badge_id) {
+        await api('/api/v1/badges/' + data.badge_id, { method: 'PATCH', body: JSON.stringify(payload) });
+      } else {
+        await api('/api/v1/badges', { method: 'POST', body: JSON.stringify(payload) });
+      }
+      closeDialog('badgeDialog');
+      toast('Badge saved');
+      await loadCredentials();
+    } else if (kind === 'discussion') {
+      const data = formData(form);
+      await api('/api/v1/courses/' + encodeURIComponent(data.course_code) + '/discussions', {
+        method: 'POST', body: JSON.stringify({ title: data.title, body: data.body }),
+      });
+      closeDialog('discussionDialog');
+      toast('Discussion created');
+      await loadDiscussions();
+    } else if (kind === 'post') {
+      const data = formData(form);
+      const payload = { body: data.body };
+      if (data.parent_id) payload.parent_id = Number(data.parent_id);
+      await api('/api/v1/discussions/' + data.discussion_id + '/posts', {
+        method: 'POST', body: JSON.stringify(payload),
+      });
+      closeDialog('postDialog');
+      toast('Reply posted');
+      await openDiscussionDetail(data.discussion_id);
+    } else if (kind === 'cohortMember') {
+      const data = formData(form);
+      await api('/api/v1/cohorts/' + data.cohort_id + '/members', {
+        method: 'POST', body: JSON.stringify({ employee_id: data.employee_id }),
+      });
+      toast('Member added');
+      await openCohortDetail(data.cohort_id);
+    } else if (kind === 'pathCourse') {
+      const data = formData(form);
+      await api('/api/v1/learning-paths/' + data.path_id + '/courses', {
+        method: 'POST', body: JSON.stringify({ course_code: data.course_code }),
+      });
+      toast('Course added to path');
+      await openPathDetail(data.path_id);
+    } else if (kind === 'award') {
+      const data = formData(form);
+      await api('/api/v1/badges/' + data.badge_id + '/award', {
+        method: 'POST', body: JSON.stringify({ employee_id: data.employee_id }),
+      });
+      toast('Badge awarded');
+      await loadCredentials();
     }
   } catch (error) {
     toast(error.message, true);
@@ -1391,6 +2112,23 @@ $('#auditFilter').addEventListener('submit', (event) => {
 });
 
 $('#learnerSelect').addEventListener('change', () => loadLearning());
+$('#gradebookLearner').addEventListener('change', () => loadGradebook());
+$('#discussionCourse').addEventListener('change', () => loadDiscussions());
+
+$('#verifyForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const result = $('#verifyResult');
+  try {
+    const data = await api('/api/v1/credentials/verify/' + encodeURIComponent(new FormData(event.target).get('code')));
+    result.hidden = false;
+    result.innerHTML = `<strong>Verified credential:</strong> ${esc(data.badge_title)} — awarded to ${esc(data.display_name)} on ${esc((data.awarded_at || '').slice(0, 10))}` +
+      (data.course_title ? `<br>Course: ${esc(data.course_title)}` : '') +
+      (data.path_title ? `<br>Path: ${esc(data.path_title)}` : '');
+  } catch (error) {
+    result.hidden = false;
+    result.textContent = error.message;
+  }
+});
 
 $$('nav button').forEach((button) => {
   button.addEventListener('click', () => showView(button.dataset.view));
@@ -1413,11 +2151,20 @@ $('#actor').addEventListener('change', () => {
 (async () => {
   try {
     const health = await api('/api/v1/health');
+    const meta = await api('/api/v1/meta');
     $('#version').textContent = 'v' + health.version;
+    const attributeSelect = $('#policyDialog form [name=attribute]');
+    if (attributeSelect && meta.policy_attributes) {
+      attributeSelect.innerHTML = meta.policy_attributes.map((name) =>
+        `<option>${esc(name)}</option>`).join('');
+    }
     $('#role').value = 'platform_admin';
     $('#actor').value = ROLE_DEFAULTS.platform_admin;
+    if (!location.hash) history.replaceState(null, '', '#/dashboard');
+    lastRouteHash = location.hash;
     await refreshSession({ reload: false });
     await Promise.all([loadDashboard(), loadCatalog()]);
+    if (location.hash !== '#/dashboard') routeFromHash(true);
   } catch (error) {
     toast(error.message, true);
   }

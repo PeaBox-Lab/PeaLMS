@@ -1,31 +1,44 @@
-# Corporate LMS v0.2.0 Release Notes
+# PeaLMS v0.4.0 Release Notes
 
 ## Release theme
 
-Enterprise controls on a dependable foundation: scoped authority, auditable
-learning lifecycle, durable notifications and a hardened HTTP surface.
+Make it like Moodle, but better: real learning content plus cohorts, paths,
+grades, credentials and discussions — without plugins, trackers, WYSIWYG HTML or
+a second database.
 
 ## Highlights
 
-- **Manager hierarchy.** Team dashboards and assignment access follow the
-  recursive reporting line. A manager sees their subtree, never the whole
-  organization, unless their role grants it.
-- **Full assignment lifecycle.** Start, complete, fail, exempt and extend. Each
-  transition is audited. Completion evidence cannot be overwritten.
-- **Certification cycles.** Courses can define a passing score and a
-  recertification period. Completing a course schedules recertification, and
-  reassignment opens a new cycle without losing history.
-- **Notification outbox.** Assignment, due-soon, overdue, completion,
-  recertification and exemption messages are persisted, rendered from templates,
-  shown in an in-app inbox, and delivered through a pluggable transport.
-- **Schema migrations.** Existing v0.1.0 databases are adopted and upgraded in
-  place. Fresh installs start at the current schema version.
-- **Versioned API.** `/api/v1` is canonical. `/api` keeps working and advertises
-  its successor.
-- **Security hardening.** Strict CSP with no inline handlers or styles, frame
-  denial, nosniff, referrer and permissions policies, request-size limits,
-  per-address rate limiting and request IDs in structured logs.
-- **Reporting.** Compliance by department and a permission-scoped CSV export.
+- **Learning content.** Courses now contain modules and ordered lessons of type
+  text, uploaded video, YouTube, link and quiz. The player tracks progress and
+  completes the assignment when required lessons are done.
+- **Assessment integrity.** Learners cannot self-report scores or skip required
+  lessons. Explanations appear only after a passing attempt.
+- **Cohorts.** Group people for targeted assignments and policies, including
+  `cohort` and `cohort_name` rule attributes.
+- **Learning paths.** Ordered courses with required steps, progress, and a safe
+  "start next course" action. Completion of one course can advance the path.
+- **Gradebook.** Assignment scores and quiz evidence are combined into a final
+  grade with a letter and an explicit source.
+- **Verifiable credentials.** Badges and completion certificates carry
+  verification codes that can be checked from the Credentials view.
+- **Discussions.** Course threads with replies, pinning, closing and moderator
+  controls, available only to people who can access the course.
+- **Role-native home.** Dashboards and navigation adapt to learner, instructor,
+  manager, admin and auditor roles.
+- **Security hardening.** Sessions are fingerprint-bound and revocable, demo
+  sessions are loopback-only, Docker demo impersonation is off, uploads stream to
+  disk with magic-byte checks, and media ranges are RFC-correct.
+- **Strict CSP preserved.** No inline handlers, no inline styles, same-origin
+  media, narrow YouTube frame origins, and zero outbound requests.
+
+## Market study applied
+
+The roadmap was informed by Canvas module requirements and SpeedGrader-style
+grading, TalentLMS/Docebo rule-based enrolment, Coursera stackable verified
+credentials, Blackboard's single "+" authoring pattern, and Udemy's
+next-best-action dashboards. We deliberately avoided Moodle settings sprawl,
+Canvas XSS/CDN exposure, plugin marketplaces, arbitrary WYSIWYG HTML, tier
+gating and passive-video-only learning.
 
 ## Upgrade notes
 
@@ -33,25 +46,26 @@ learning lifecycle, durable notifications and a hardened HTTP surface.
 2. Run `python -m lms.server --migrate-only`.
 3. Start the application normally.
 
-The migration adds course certification columns, rebuilds the assignment table
-to add cycles and lifecycle fields, and creates the notification outbox. It is
-forward-only; roll back by restoring the backup.
+Migration 4 adds engagement tables; migration 5 adds session revocations and the
+session epoch. Both are forward-only. Roll back by restoring the backup.
+
+If you used a demo database from v0.3.0, delete it and let v0.4.0 reseed it to
+see the new cohorts, paths, badges and discussions. Production data is migrated
+in place.
 
 ## Known limitations
 
-- Signed demo sessions are disabled by default and are not production identity
-  federation. They must be explicitly enabled for local evaluation.
-- Demo sessions are bearer tokens held in memory by the browser client. Do not
-  expose demo mode to untrusted networks.
-- Rate limiting is in-process; a multi-replica deployment needs a shared store.
-- SQLite is intended for evaluation and controlled pilots, not global scale.
-- Course content delivery is metadata-only; SCORM runtime, assessments and
-  object storage are roadmap items.
-- Email delivery is a structured-log transport by default; SMTP is a v0.2.x
-  roadmap item.
-- The browser UI is responsive and keyboard-oriented but has not completed an
-  independent WCAG conformance audit.
-- Multi-tenancy, SCIM, xAPI and LTI are not implemented.
+- Session tokens are still bearer tokens for a pilot; production identity must
+  be OIDC/SAML with server-side scope derivation.
+- Media links are short-lived capabilities, not per-user access tokens. Do not
+  put highly sensitive media behind them without an identity-aware proxy.
+- Multi-process deployments need a shared secret and a shared rate limiter; the
+  SQLite database must remain single-writer.
+- Email delivery is a structured-log transport; SMTP is still a roadmap item.
+- Offline course packs, SCORM, xAPI, LTI, tenant isolation and WCAG 2.2 AA
+  conformance evidence are not yet implemented.
+- The browser UI has been checked manually but has not had an independent
+  screen-reader audit.
 
 ## Upgrade policy
 

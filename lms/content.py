@@ -136,6 +136,12 @@ def _progress_summary(conn, employee_id, course_code) -> dict:
     }
 
 
+def _video_ttl(lesson) -> int:
+    """Keep a lesson's signed stream valid long enough to finish watching it."""
+    minutes = int(lesson.get("duration_minutes") or 0)
+    return max(900, minutes * 60 + 600)
+
+
 def _serialize_lesson(lesson, progress, conn) -> dict:
     item = dict(lesson)
     item["type"] = item.pop("lesson_type")
@@ -147,7 +153,8 @@ def _serialize_lesson(lesson, progress, conn) -> dict:
         item["youtube_id"] = item["content"]
     elif item["type"] == "video":
         item["stream_url"] = (
-            media.url_for(item["media_id"]) if item.get("media_id") else item.get("content", "")
+            media.url_for(item["media_id"], ttl=_video_ttl(item))
+            if item.get("media_id") else item.get("content", "")
         )
     item["progress"] = progress
     return item
@@ -169,11 +176,13 @@ def _course_or_raise(conn, course_code):
 def list_courses(actor=None, *, include_unpublished=False, status=None,
                  category=None, q=None, active_only=False) -> list[dict]:
     clauses, params = [], []
-    if status:
+    if not include_unpublished:
+        clauses.append("c.status='published'")
+        if status and str(status).strip().lower() != "published":
+            clauses.append("1 = 0")
+    elif status:
         clauses.append("c.status=?")
         params.append(status)
-    elif not include_unpublished:
-        clauses.append("c.status='published'")
     if not include_unpublished or active_only:
         clauses.append("c.active=1")
     if category:
@@ -449,7 +458,8 @@ def create_lesson(module_id, data, actor="admin"):
     duration = int(data.get("duration_minutes", 0) or 0)
     if duration < 0 or duration > 100_000:
         raise ValueError("duration_minutes must be between 0 and 100000")
-    pass_score = float(data.get("quiz_pass_score", 70) or 70)
+    raw_score = data.get("quiz_pass_score", 70)
+    pass_score = 70 if raw_score in (None, "") else float(raw_score)
     if not 0 <= pass_score <= 100:
         raise ValueError("quiz_pass_score must be between 0 and 100")
     content, media_id = _prepare_lesson(data, lesson_type)
@@ -505,7 +515,8 @@ def update_lesson(lesson_id, data, actor="admin"):
         duration = int(data.get("duration_minutes", existing["duration_minutes"]) or 0)
         if duration < 0 or duration > 100_000:
             raise ValueError("duration_minutes must be between 0 and 100000")
-        pass_score = float(data.get("quiz_pass_score", existing["quiz_pass_score"]) or 0)
+        raw_score = data.get("quiz_pass_score", existing["quiz_pass_score"])
+        pass_score = float(existing["quiz_pass_score"]) if raw_score in (None, "") else float(raw_score)
         if not 0 <= pass_score <= 100:
             raise ValueError("quiz_pass_score must be between 0 and 100")
         is_required = 1 if data.get("is_required", bool(existing["is_required"])) else 0
@@ -815,21 +826,22 @@ def submit_quiz(employee_id, lesson_id, answers, actor=None):
         if not questions:
             raise ValueError("This quiz has no questions yet")
         given = _normalise_answers(answers, len(questions))
-        correct = 0
-        results = []
-        for question, answer in zip(questions, given):
-            is_correct = answer == question["correct_index"]
-            correct += 1 if is_correct else 0
-            results.append({
-                "question_id": question["id"],
-                "given_index": answer,
-                "correct_index": question["correct_index"],
-                "correct": is_correct,
-                "explanation": question["explanation"],
-            })
+        correct = sum(1 for question, answer in zip(questions, given)
+                      if answer == question["correct_index"])
         score = round(100 * correct / len(questions), 1)
         pass_score = float(lesson["quiz_pass_score"] or 0)
         passed = score >= pass_score
+        results = []
+        for question, answer in zip(questions, given):
+            is_correct = answer == question["correct_index"]
+            item = {
+                "question_id": question["id"],
+                "given_index": answer,
+                "correct": is_correct,
+            }
+            if passed:
+                item["explanation"] = question["explanation"]
+            results.append(item)
         conn.execute(
             "INSERT INTO quiz_attempts(employee_id,lesson_id,score,passed,answers_json) "
             "VALUES(?,?,?,?,?)",

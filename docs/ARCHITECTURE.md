@@ -2,11 +2,10 @@
 
 ## Release architecture
 
-v0.2.0 remains deliberately dependency-light: a Python standard-library HTTP
+v0.4.0 remains deliberately dependency-light: a Python standard-library HTTP
 service, SQLite transactional store, and a static HTML/CSS/JavaScript client.
-The difference from v0.1.0 is structure: configuration, transport, routing,
-domain rules, notifications and reporting now have explicit boundaries, and the
-schema is versioned.
+Configuration, transport, routing, content, engagement, media, notifications and
+reporting have explicit boundaries, and the schema is versioned through v5.
 
 ```
 browser (CSP-safe vanilla JS)
@@ -17,7 +16,10 @@ lms/server.py        transport: parsing, rate limit, headers, request ids
         ▼
 lms/api.py           versioned routes, permission checks, error mapping
         │
-        ├── lms/services.py      domain rules, read models, lifecycle, org scoping
+        ├── lms/services.py      org rules, assignments, policies, HRIS-facing rules
+        ├── lms/content.py       modules, lessons, quizzes, progress, completion
+        ├── lms/engagement.py    cohorts, paths, gradebook, credentials, discussions
+        ├── lms/media.py         streaming uploads, validation, signed URLs
         ├── lms/hris.py          import validation, diff, guarded application
         ├── lms/notifications.py outbox, templates, inbox, delivery
         └── lms/reports.py       compliance export
@@ -29,23 +31,25 @@ lms/db.py  →  SQLite  ←  lms/migrations.py
 Cross-cutting modules:
 
 - `lms/config.py` — one validated `Settings` object, lazily cached.
-- `lms/auth.py` — HMAC-signed session tokens with issuer, subject, issued-at,
-  expiry and token id.
+- `lms/auth.py` — fingerprint-bound HMAC tokens with revocation and epoch rotation.
 - `lms/permissions.py` — role → permission catalogue.
 - `lms/security.py` — rate limiter, security headers, structured access logs.
 - `lms/audit.py` — transactional audit event writer.
+- `lms/content.py` and `lms/engagement.py` — learning and engagement domains.
 
 ## Request lifecycle
 
-1. `server.Handler` assigns a request id and applies the per-address rate limit.
-2. It parses the body with the configured size limit and resolves the bearer
-   token to an identity.
+1. `server.Handler` assigns a request id and resolves the bearer token to an
+   identity, including fingerprint and revocation checks.
+2. It applies a rate limit keyed by client address and identity. Media uploads
+   stream to a spooled temporary file instead of being buffered in memory.
 3. `api.handle` normalises `/api` to `/api/v1`, matches a route, and dispatches.
-4. The handler checks permissions and calls a service.
+4. The handler checks permissions and calls a domain service.
 5. Services validate state, write data and audit events in one transaction.
 6. Errors are mapped: `ApiError` keeps its status, `ValueError`/`KeyError`
-   become 400, unique violations become 409.
-7. The transport writes JSON or CSV with security headers and the request id.
+   become 400, unique violations become 409, bad media ranges become 416.
+7. The transport writes JSON, CSV or streamed media with security headers and
+   the request id.
 
 ## Data model
 
@@ -59,9 +63,16 @@ Core entities:
 - `assignment_policies` — attribute/operator/value rules with a due window.
 - `assignments` — per employee, course and **cycle**; status, attempts,
   exemption, score, completion, recertification due date and source.
+- `course_modules`, `lessons`, `quiz_questions`, `quiz_attempts`,
+  `lesson_progress`, `media` — learning content and evidence.
+- `cohorts`, `cohort_members`, `learning_paths`, `learning_path_courses` —
+  grouping and sequencing.
+- `badges`, `badge_awards` — criteria and verifiable credentials.
+- `discussions`, `discussion_posts` — threaded course conversations.
 - `notifications` — durable outbox and inbox.
 - `import_jobs` — checksum, counts and reconciliation summary.
 - `audit_events` — append-only event history.
+- `session_revocations`, `app_state` — token revocation and session epoch.
 - `schema_migrations` — applied migration ledger.
 
 ### Assignment state machine
@@ -85,6 +96,27 @@ Rules:
 - Reassignment is only allowed when the latest cycle is closed.
 - Audit entity ids stay stable (`employee:course`); the cycle is recorded in the
   event details.
+
+## Learning and engagement flow
+
+`content.py` owns modules, lessons, quiz attempts and progress. Passing a
+required quiz marks the lesson complete; when every required lesson is complete,
+`_maybe_complete()` calls `services.complete_assignment()` so the canonical
+assignment lifecycle, notifications and audit events stay in one place.
+Learners cannot call completion directly, and failed quizzes do not expose
+explanations.
+
+`engagement.on_course_completed()` runs from that same completion hook. It:
+
+1. awards course badges whose criteria match the completed course;
+2. recomputes learning paths and assigns the next required course; and
+3. awards path certificates once every required course is done.
+
+Gradebook reads are derived: assignment scores take precedence, otherwise quiz
+attempts are averaged. Credentials carry a verification code that resolves
+without authentication, but the award record itself is only writable through
+privileged endpoints. Discussion posting checks course enrolment or a management
+role; moderation is separate from authorship.
 
 ## Organization scoping
 
@@ -121,15 +153,19 @@ operation. Sweeps deduplicate per assignment cycle by checking
 
 ## Security posture
 
-- Strict CSP (`script-src 'self'`, `style-src 'self'`, `frame-ancestors 'none'`).
-- No inline event handlers or inline styles in the client.
+- Strict CSP (`script-src 'self'`, `style-src 'self'`, `media-src 'self'`, narrow
+  YouTube frame origins, `frame-ancestors 'none'`).
+- No inline event handlers or inline styles in the client; external video URLs
+  are rejected rather than silently blocked.
 - `X-Frame-Options: DENY`, `nosniff`, no-referrer, restrictive permissions
   policy, and HSTS when TLS is terminated upstream.
-- Bearer tokens in the `Authorization` header, so browser requests are not
-  ambient credentials and classic CSRF does not apply. If the deployment moves
-  to cookies, CSRF tokens become mandatory.
+- Fingerprint-bound bearer tokens in the `Authorization` header, with revocation
+  and epoch rotation. Browser requests are not ambient credentials, so classic
+  CSRF does not apply; cookies would require CSRF tokens.
 - Parameterized SQL, foreign keys enabled, transaction rollback on error.
-- Request body size limit and per-address rate limiting.
+- Streaming uploads with MIME/magic-byte validation; short-lived signed media
+  URLs with lesson-aware lifetimes, client refresh and safe range semantics.
+- JSON body limit plus per-client/identity rate limiting.
 - Structured access logs with request ids; no secrets or personal payloads are
   logged.
 
@@ -172,10 +208,10 @@ warnings or row errors respectively.
 
 ## Next architectural increments
 
-1. Federated identity and token/session hardening for pilot use.
-2. Scheduled worker entry point with a durable job ledger.
-3. Object storage and versioned content publishing.
-4. PostgreSQL repositories and tenant context on every query.
+1. Federated identity and shared session/rate-limit infrastructure for pilots.
+2. PostgreSQL repositories and tenant context on every query.
+3. Scheduled worker entry point with a durable job ledger.
+4. Declarative course packages and offline signed sync.
 5. Transactional outbox to an event bus and signed webhooks.
 6. Permission-aware search and governed analytics.
 7. Formal SLOs, backups, restore exercises and disaster recovery.

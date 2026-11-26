@@ -43,12 +43,26 @@ def _fetch(employee_ids=None, department=None):
         ).fetchall()]
 
 
+def _csv_safe(value):
+    """Neutralise spreadsheet formula injection from HRIS-controlled text."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return value
+    text = value.lstrip("\ufeff")
+    if text[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + text
+    return text
+
+
 def compliance_csv(employee_ids=None, department=None) -> str:
     buffer = io.StringIO()
     writer = csv.DictWriter(buffer, fieldnames=EXPORT_COLUMNS, extrasaction="ignore")
     writer.writeheader()
     for row in _fetch(employee_ids, department):
-        writer.writerow({key: "" if row.get(key) is None else row.get(key) for key in EXPORT_COLUMNS})
+        writer.writerow({
+            key: _csv_safe(row.get(key)) for key in EXPORT_COLUMNS
+        })
     return buffer.getvalue()
 
 

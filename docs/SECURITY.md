@@ -5,13 +5,21 @@
 ### Authentication and authorization
 - Server-side permission checks on every mutating endpoint and every read that
   exposes people data.
-- Short-lived HMAC-signed sessions with issuer, subject, issued-at, expiry and
-  unique token id claims. Arbitrary role headers are never trusted.
-- Tampered, expired, wrong-issuer and unknown-role tokens are rejected.
+- Short-lived HMAC-signed sessions with issuer, subject, issued-at, expiry,
+  unique token id, browser fingerprint and persisted epoch claims. Arbitrary
+  role headers are never trusted.
+- Tampered, expired, wrong-issuer, unknown-role, revoked and stale-epoch tokens
+  are rejected. `POST /session/logout` revokes one token; `POST /session/rotate`
+  invalidates all tokens.
+- Demo sessions are restricted to loopback clients and are disabled in the
+  shipped Docker stack; demo impersonation is never a production identity.
 - Learner completion is bound to the signed employee identity; privileged
-  completion requires a server-validated role.
+  completion requires a server-validated role. Learners cannot self-report
+  scores or skip required lessons.
 - Manager access is additionally checked against the recursive reporting
-  subtree, not just the role name.
+  subtree, not just the role name, including unfiltered assignment lists.
+- Course discussions require enrollment for readers as well as posters;
+  unauthorized course identifiers do not expose threads or replies.
 
 ### Data integrity
 - Completed evidence cannot be silently overwritten; a second completion is a
@@ -21,23 +29,42 @@
 - Assignment cycles preserve history across recertification.
 - Parameterized SQL, foreign keys enabled, and rollback on any error.
 - Transactional import application with checksum idempotency and anomaly
-  blocking.
+  blocking; authoritative full extracts replace stale derived roles.
 - No destructive change when a dry run has blockers.
+- Assignment due dates are bounded and draft curricula cannot be bypassed by
+  self-completion.
 - Audit events for employees, courses, policies, assignments, starts,
-  completions, failures, exemptions, extensions, imports and suspensions.
+  completions, failures, exemptions, extensions, imports, suspensions, cohorts,
+  paths, badges, awards, discussions and media uploads.
+- Gradebook grades derive from assignment scores and quiz attempts; failed quiz
+  attempts do not reveal explanations.
+- Badge criteria are validated against known courses and paths; verification
+  codes are unguessable and resolve to a signed award record without exposing
+  the recipient's work email.
+- Discussion posting requires course access; moderators alone may delete threads.
 
 ### Transport and browser
 - Strict Content Security Policy: `default-src 'self'`, `script-src 'self'`,
-  `style-src 'self'`, `object-src 'none'`, `base-uri 'none'`,
-  `frame-ancestors 'none'`.
-- No inline event handlers or inline `style` attributes in the client.
+  `style-src 'self'`, `media-src 'self'`, narrow YouTube frame origins,
+  `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`.
+- No inline event handlers or inline `style` attributes in the client. External
+  video URLs are rejected; uploaded videos play from this origin only.
 - `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, no-referrer,
   restrictive permissions policy, cross-origin isolation headers.
 - HSTS when TLS is terminated upstream (`X-Forwarded-Proto: https`).
-- Request body size limit and per-address sliding-window rate limiting.
-- Static-path traversal protection.
-- Request ids and structured JSON access logs.
-- HTML escaping before displaying returned values.
+- JSON body size limit plus streaming uploads validated by declared MIME type
+  and magic bytes; unvalidated container formats such as MKV are rejected.
+- Signed upload links expire after five minutes; lesson stream URLs are signed
+  for the declared lesson duration (at least fifteen minutes) and refreshed by
+  the client before expiry. Byte ranges are validated, and unsatisfiable ranges
+  return 416 rather than leaking partial content.
+- Per-client/identity sliding-window rate limiting; static-path traversal
+  protection; request ids and structured JSON access logs.
+- HTML escaping before displaying returned values; CSV exports neutralise
+  formula-injection prefixes.
+- Session switches cancel in-flight view and import work so stale identities
+  cannot repopulate the interface; raw media/export requests re-authenticate on
+  401 like JSON requests.
 - Bearer tokens are not ambient credentials, which removes classic CSRF for the
   current client. Moving to cookies requires CSRF tokens.
 
@@ -48,7 +75,8 @@
   role and scope claims.
 - If cookies replace bearer tokens: secure, HttpOnly, SameSite cookies plus CSRF
   tokens and origin checks.
-- Privileged-access review, MFA, break-glass procedures and session revocation.
+- Privileged-access review, MFA, break-glass procedures and IdP-driven session
+  lifecycle (the built-in revocation and epoch rotation are pilot primitives).
 
 ### Platform
 - HTTPS-only operation with a managed certificate and strict transport policy.
@@ -78,7 +106,9 @@ scanning, retention limits and restricted operator access.
 
 The pipeline validates required fields, controlled values, dates and manager
 references, but it is not a substitute for source-system controls. Treat the
-HRIS as authoritative and reconcile rather than overwrite blindly.
+HRIS as authoritative and reconcile rather than overwrite blindly. The browser
+client stores the reviewed dry-run snapshot and disables **Apply** if the file
+or options change before confirmation.
 
 ## Responsible use
 
