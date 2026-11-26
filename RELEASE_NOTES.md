@@ -1,12 +1,12 @@
-# PeaLMS v0.4.0 Release Notes
+# PeaLMS v0.5.0 Release Notes
 
 ## Release theme
 
-Make it like Moodle, but better: real learning content plus cohorts, paths,
-grades, credentials and discussions — without plugins, trackers, WYSIWYG HTML or
-a second database.
+Make the v0.4.0 LMS safe to pilot with real people data: trusted identity from
+an authenticating proxy, durable background work, auditable delivery attempts,
+and no new runtime dependency.
 
-## Highlights
+## v0.4.0 highlights
 
 - **Learning content.** Courses now contain modules and ordered lessons of type
   text, uploaded video, YouTube, link and quiz. The player tracks progress and
@@ -31,6 +31,25 @@ a second database.
 - **Strict CSP preserved.** No inline handlers, no inline styles, same-origin
   media, narrow YouTube frame origins, and zero outbound requests.
 
+## v0.5.0 highlights
+
+- **Trusted identity.** A reverse proxy that already performed OIDC/SAML
+  authentication signs a short assertion. PeaLMS verifies its HMAC, freshness,
+  replay nonce and source network, then derives the role from a server-side
+  group map. No request field can supply a role.
+- **Durable work.** Notification sweeps, policy reassessment and outbox
+  delivery are jobs in a SQLite ledger. Claims are atomic; failures retry with
+  backoff and terminal failures are retained for inspection.
+- **Worker CLI.** `python -m lms.worker --once` suits cron;
+  `--poll-seconds` runs a persistent worker. Multiple workers can share the
+  database safely.
+- **SMTP mirror.** When SMTP is configured, queued notifications are delivered
+  by email after the outbox record exists. The in-app inbox remains authoritative.
+- **Operations evidence.** Admins and auditors can inspect jobs, retries, job
+  events and delivery attempts from the browser.
+- **Pilot-safe UI.** Demo impersonation controls are hidden when the server runs
+  in proxy identity mode.
+
 ## Market study applied
 
 The roadmap was informed by Canvas module requirements and SpeedGrader-style
@@ -46,26 +65,29 @@ gating and passive-video-only learning.
 2. Run `python -m lms.server --migrate-only`.
 3. Start the application normally.
 
-Migration 4 adds engagement tables; migration 5 adds session revocations and the
-session epoch. Both are forward-only. Roll back by restoring the backup.
+Migrations 4, 5 and 6 add engagement tables, session controls, and the job and
+delivery ledger respectively. All are forward-only. Roll back by restoring the
+backup.
 
-If you used a demo database from v0.3.0, delete it and let v0.4.0 reseed it to
-see the new cohorts, paths, badges and discussions. Production data is migrated
-in place.
+If you used a demo database from v0.3.0 or v0.4.0, delete it and let v0.5.0
+reseed it to see the current sample data. Production data is migrated in place.
 
 ## Known limitations
 
-- Session tokens are still bearer tokens for a pilot; production identity must
-  be OIDC/SAML with server-side scope derivation.
+- Proxy identity is a signed-header pilot, not a full OIDC relying party with
+  discovery, JWKS rotation or SAML POST binding. The reverse proxy must perform
+  the real federation and be the only network source allowed to assert identity.
+- Browser sessions remain bearer tokens; cookies with CSRF and origin checks are
+  deferred with the multi-tenant scale increment.
 - Media links are short-lived capabilities, not per-user access tokens. Do not
   put highly sensitive media behind them without an identity-aware proxy.
 - Multi-process deployments need a shared secret and a shared rate limiter; the
   SQLite database must remain single-writer.
-- Email delivery is a structured-log transport; SMTP is still a roadmap item.
-- Offline course packs, SCORM, xAPI, LTI, tenant isolation and WCAG 2.2 AA
-  conformance evidence are not yet implemented.
+- PostgreSQL, tenant context, delegated administration and shared quota storage
+  are not yet implemented.
+- Offline course packs, SCORM, xAPI and LTI are not yet implemented.
 - The browser UI has been checked manually but has not had an independent
-  screen-reader audit.
+  screen-reader audit or formal WCAG 2.2 AA conformance testing.
 
 ## Upgrade policy
 

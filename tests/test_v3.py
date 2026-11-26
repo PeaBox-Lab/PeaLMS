@@ -47,8 +47,8 @@ class IsolatedContentDb(unittest.TestCase):
 
 
 class ContentSchemaTests(IsolatedContentDb):
-    def test_schema_version_is_five(self):
-        self.assertEqual(schema_version(), 5)
+    def test_schema_version_is_six(self):
+        self.assertEqual(schema_version(), 6)
 
     def test_seeded_catalog_has_curriculum(self):
         courses = content.list_courses("E1003")

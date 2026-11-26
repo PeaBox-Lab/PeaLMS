@@ -9,9 +9,11 @@ the message; a production deployment plugs an email or chat transport into
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from string import Template
 
+from . import email as email_transport
+from .config import get_settings
 from .db import connection, row, rows
 
 logger = logging.getLogger("lms.notifications")
@@ -172,32 +174,101 @@ def mark_all_read(employee_id) -> int:
         return int(cur.rowcount)
 
 
-def deliver(transport=None, *, limit=100) -> int:
-    """Deliver queued notifications through a transport.
+def _record_delivery(conn, item: dict, status: str, attempts: int, error: str,
+                     transport_name: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO notification_deliveries
+          (notification_id, channel, transport, status, attempts, last_error)
+        VALUES(?,?,?,?,?,?)
+        """,
+        (item["id"], item.get("channel", "in_app"), transport_name,
+         status, attempts, (error or "")[:1000]),
+    )
+
+
+def deliver(transport=None, *, limit=100, max_attempts=None) -> int:
+    """Deliver due notifications with bounded retries and a dead-letter trail.
 
     ``transport`` receives ``(notification_dict)`` and may raise to signal a
-    transient failure; failed rows stay queued for the next sweep.
+    failure. Without an explicit transport, SMTP is used when configured and a
+    structured log transport is used otherwise.
     """
-    transport = transport or _log_transport
+    settings = get_settings()
+    transport = transport or (
+        email_transport.smtp_transport if settings.smtp_enabled else _log_transport
+    )
+    transport_name = getattr(transport, "__name__", "custom")
+    maximum = int(max_attempts or settings.smtp_max_attempts)
+    now = _now()
     with connection() as conn:
         queued = [dict(r) for r in conn.execute(
-            "SELECT * FROM notifications WHERE status='queued' ORDER BY id LIMIT ?",
-            (int(limit),),
+            """
+            SELECT * FROM notifications
+            WHERE status='queued'
+              AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+            ORDER BY id LIMIT ?
+            """,
+            (now, int(limit)),
         ).fetchall()]
     delivered = 0
     for item in queued:
+        attempts = int(item.get("attempts") or 0) + 1
+        error = ""
         try:
             transport(item)
-        except Exception:  # pragma: no cover - transport specific
-            logger.exception("Notification delivery failed for id=%s", item["id"])
-            continue
+        except Exception as exc:
+            error = str(exc)
+            logger.warning("Notification delivery failed id=%s: %s", item["id"], error)
+            if attempts >= maximum:
+                status = "dead"
+                next_attempt = None
+            else:
+                status = "queued"
+                delay = min(300, 30 * (2 ** max(0, attempts - 1)))
+                next_attempt = (
+                    datetime.now(timezone.utc) + timedelta(seconds=delay)
+                ).isoformat()
+        else:
+            status = "sent"
+            next_attempt = None
+            delivered += 1
         with connection() as conn:
             conn.execute(
-                "UPDATE notifications SET status='sent', sent_at=? WHERE id=?",
-                (_now(), item["id"]),
+                """
+                UPDATE notifications
+                SET status=?, attempts=?, last_error=?, next_attempt_at=?, sent_at=?
+                WHERE id=?
+                """,
+                (status, attempts, error[:1000] or None, next_attempt,
+                 now if status == "sent" else None, item["id"]),
             )
-        delivered += 1
+            _record_delivery(
+                conn, item,
+                "sent" if status == "sent" else ("dead" if status == "dead" else "failed"),
+                attempts, error, transport_name,
+            )
     return delivered
+
+
+def list_deliveries(*, status: str = "", limit: int = 100, offset: int = 0) -> dict:
+    where = "WHERE d.status=?" if status else ""
+    params: list = [status] if status else []
+    with connection() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM notification_deliveries d {where}", params
+        ).fetchone()[0]
+        items = [dict(item) for item in conn.execute(
+            f"""
+            SELECT d.*, n.template, n.recipient_employee_id, n.subject
+            FROM notification_deliveries d
+            JOIN notifications n ON n.id=d.notification_id
+            {where}
+            ORDER BY d.id DESC LIMIT ? OFFSET ?
+            """,
+            params + [int(limit), int(offset)],
+        ).fetchall()]
+    return {"items": items, "total": total, "limit": int(limit), "offset": int(offset)}
 
 
 def _log_transport(item: dict) -> None:

@@ -88,7 +88,7 @@ class MigrationTests(IsolatedDb):
             conn.execute(statement)
         conn.commit()
         applied = migrate(conn)
-        self.assertEqual(applied, [2, 3, 4, 5])
+        self.assertEqual(applied, [2, 3, 4, 5, 6])
         columns = {row[1] for row in conn.execute("PRAGMA table_info(assignments)")}
         self.assertIn("cycle", columns)
         self.assertIn("recert_due_date", columns)

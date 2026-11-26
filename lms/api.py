@@ -15,7 +15,7 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import content, engagement, hris, media, notifications, reports, services
+from . import content, engagement, hris, jobs, media, notifications, reports, services
 from .auth import issue_token, revoke_jti, rotate_session_epoch
 from .config import get_settings
 from .db import SCHEMA_VERSION
@@ -115,9 +115,13 @@ def health(req: Request) -> Result:
 
 
 def meta(req: Request) -> Result:
+    settings = get_settings()
     return Result({
-        "version": get_settings().version,
+        "version": settings.version,
         "schema_version": SCHEMA_VERSION,
+        "auth_mode": settings.auth_mode,
+        "demo_mode": settings.demo_mode,
+        "smtp_enabled": settings.smtp_enabled,
         "roles": {role: sorted(perms) for role, perms in ROLE_PERMISSIONS.items()},
         "assignment_statuses": list(services.ASSIGNMENT_STATUSES),
         "policy_operators": list(services.POLICY_OPERATORS),
@@ -569,7 +573,68 @@ def mark_all_notifications_read(req: Request) -> Result:
 
 def notification_sweep(req: Request) -> Result:
     req.require("manage_learning")
-    return Result(services.run_notification_sweeps())
+    job_id = jobs.enqueue(
+        "notification_sweep",
+        {"days_soon": 7, "days_recert": 30},
+        actor=req.actor,
+    )
+    return Result({"queued": True, "job_id": job_id}, 202)
+
+
+def _require_operations_read(req: Request) -> None:
+    if not (req.can("audit") or req.can("manage_learning")):
+        if not req.identity:
+            raise ApiError(401, "unauthorized", "A valid session is required")
+        raise ApiError(403, "forbidden", "Operations evidence requires audit or manage_learning")
+
+
+def _job_id(req: Request, value: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ApiError(400, "validation_error", "Invalid job id") from exc
+
+
+def list_jobs(req: Request) -> Result:
+    _require_operations_read(req)
+    limit, offset = _paging(req, 100)
+    return Result(jobs.list_jobs(status=req.query.get("status", ""),
+                                 limit=limit, offset=offset))
+
+
+def get_job(req: Request, job_id: str) -> Result:
+    _require_operations_read(req)
+    item = jobs.get_job(_job_id(req, job_id))
+    if not item:
+        raise ApiError(404, "not_found", "Job not found")
+    return Result(item)
+
+
+def queue_job(req: Request) -> Result:
+    req.require("manage_learning")
+    job_type = str(req.body.get("job_type", "")).strip()
+    if job_type not in jobs.JOB_TYPES:
+        raise ApiError(400, "validation_error", "Unknown job type")
+    payload = req.body.get("payload") or {}
+    if not isinstance(payload, dict):
+        raise ApiError(400, "validation_error", "payload must be an object")
+    job_id = jobs.enqueue(job_type, payload, actor=req.actor)
+    return Result({"queued": True, "job_id": job_id}, 202)
+
+
+def retry_job(req: Request, job_id: str) -> Result:
+    req.require("manage_learning")
+    if not jobs.retry(_job_id(req, job_id), req.actor):
+        raise ApiError(409, "conflict", "Only failed jobs can be retried")
+    return Result({"status": "queued", "job_id": int(job_id)})
+
+
+def list_deliveries(req: Request) -> Result:
+    _require_operations_read(req)
+    limit, offset = _paging(req, 100)
+    return Result(notifications.list_deliveries(
+        status=req.query.get("status", ""), limit=limit, offset=offset
+    ))
 
 
 def compliance_csv(req: Request) -> Result:
@@ -991,6 +1056,11 @@ ROUTES: list[Route] = [
     ("POST", re.compile(r"^/notifications/read-all$"), mark_all_notifications_read),
     ("POST", re.compile(r"^/notifications/(?P<notification_id>\d+)/read$"), mark_notification_read),
     ("POST", re.compile(r"^/notifications/sweep$"), notification_sweep),
+    ("GET", re.compile(r"^/jobs$"), list_jobs),
+    ("POST", re.compile(r"^/jobs$"), queue_job),
+    ("GET", re.compile(r"^/jobs/(?P<job_id>\d+)$"), get_job),
+    ("POST", re.compile(r"^/jobs/(?P<job_id>\d+)/retry$"), retry_job),
+    ("GET", re.compile(r"^/outbox$"), list_deliveries),
     ("GET", re.compile(r"^/reports/compliance\.csv$"), compliance_csv),
     ("GET", re.compile(r"^/audit$"), audit),
     ("GET", re.compile(r"^/import-jobs$"), import_jobs),

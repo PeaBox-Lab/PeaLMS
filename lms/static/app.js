@@ -25,6 +25,9 @@ const state = {
   importSignature: '',
   importSnapshot: null,
   videoRefreshTimer: null,
+  authMode: 'demo',
+  jobs: null,
+  outbox: null,
 };
 
 let sessionGeneration = 0;
@@ -133,10 +136,14 @@ async function createSession(role, actor) {
 }
 
 async function refreshSession({ reload = true } = {}) {
-  const role = $('#role').value;
-  const actor = $('#actor').value.trim() || ROLE_DEFAULTS[role] || 'demo-admin';
-  $('#actor').value = actor;
-  await createSession(role, actor);
+  if (state.authMode === 'proxy') {
+    state.token = '';
+  } else {
+    const role = $('#role').value;
+    const actor = $('#actor').value.trim() || ROLE_DEFAULTS[role] || 'demo-admin';
+    $('#actor').value = actor;
+    await createSession(role, actor);
+  }
   const generation = ++sessionGeneration;
   playerGeneration += 1;
   if (state.videoRefreshTimer) {
@@ -146,6 +153,10 @@ async function refreshSession({ reload = true } = {}) {
   const me = await api('/api/v1/me');
   if (!isCurrent(generation)) return;
   state.me = me;
+  if (state.authMode === 'proxy') {
+    $('#role').value = me.session_role || me.role || 'learner';
+    $('#actor').value = me.employee_id || '';
+  }
   state.permissions = new Set(me.permissions || []);
   state.employees = [];
   state.courses = [];
@@ -174,6 +185,8 @@ async function refreshSession({ reload = true } = {}) {
 }
 
 function applyPermissions() {
+  const demoControls = $('#demoControls');
+  if (demoControls) demoControls.hidden = state.authMode === 'proxy';
   $$('[data-perm]').forEach((el) => {
     const allowed = can(el.dataset.perm);
     el.hidden = !allowed;
@@ -186,7 +199,7 @@ function applyPermissions() {
     el.classList.toggle('is-hidden', !allowed);
   });
   const activeNav = $('nav button.active');
-  if (activeNav && activeNav.hidden) showView('dashboard', false);
+  if (activeNav && activeNav.hidden) showView('dashboard');
 }
 
 function updateBell(count) {
@@ -224,9 +237,10 @@ function kpis(items) {
 function statusTag(value) {
   const map = {
     completed: 'green', active: 'green', applied: 'green', published: 'green',
+    succeeded: 'green', sent: 'green',
     assigned: 'amber', in_progress: 'amber', future: 'amber', leave: 'amber',
-    draft: 'amber',
-    failed: 'red', inactive: 'red', terminated: 'red', exempted: 'red',
+    draft: 'amber', queued: 'amber', running: 'amber',
+    failed: 'red', dead: 'red', inactive: 'red', terminated: 'red', exempted: 'red',
     archived: '',
   };
   const label = String(value || '').replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
@@ -1154,6 +1168,42 @@ async function loadAudit(query = {}) {
   }
 }
 
+async function loadOperations() {
+  const generation = sessionGeneration;
+  try {
+    const [queued, deliveries] = await Promise.all([
+      api('/api/v1/jobs?limit=100'),
+      api('/api/v1/outbox?limit=100'),
+    ]);
+    if (!isCurrent(generation)) return;
+    state.jobs = queued;
+    state.outbox = deliveries;
+    const jobRows = (queued.items || []).map((item) => [
+      `#${esc(item.id)}`, esc(item.job_type), statusTag(item.status),
+      esc(item.attempts + '/' + item.max_attempts),
+      esc((item.run_at || '').slice(0, 19).replace('T', ' ')),
+      esc((item.last_error || '').slice(0, 60) || '—'),
+      item.status === 'failed'
+        ? `<button type="button" class="small" data-action="retry-job" data-job="${esc(item.id)}">Retry</button>`
+        : '<span class="muted">—</span>',
+    ]);
+    const deliveryRows = (deliveries.items || []).map((item) => [
+      `#${esc(item.id)}`, esc(item.recipient_employee_id), esc(item.template),
+      statusTag(item.status), esc(item.transport), esc(item.attempts),
+      esc((item.last_error || '').slice(0, 60) || '—'),
+    ]);
+    $('#jobRows').innerHTML = jobRows.length
+      ? table(['Job', 'Type', 'Status', 'Attempts', 'Run at', 'Last error', ''], jobRows)
+      : '<div class="empty">No jobs have been queued.</div>';
+    $('#outboxRows').innerHTML = deliveryRows.length
+      ? table(['#', 'Recipient', 'Template', 'Status', 'Transport', 'Attempts', 'Last error'], deliveryRows)
+      : '<div class="empty">No delivery attempts have been recorded.</div>';
+    $('#operationsMeta').textContent = `${queued.total} job(s) · ${deliveries.total} delivery attempt(s)`;
+  } catch (error) {
+    if (isCurrent(generation)) toast(error.message, true);
+  }
+}
+
 /* ------------------------------------------------------------- engagement */
 
 function badgeGlyph(icon) {
@@ -1518,6 +1568,7 @@ const VIEW_LOADERS = {
   notifications: loadNotifications,
   hris: loadImportJobs,
   audit: () => loadAudit(),
+  operations: loadOperations,
 };
 
 function activateView(name, push = true) {
@@ -1654,6 +1705,19 @@ document.addEventListener('click', async (event) => {
       await loadTeam();
     } else if (action === 'refresh-audit') {
       await loadAudit();
+    } else if (action === 'refresh-operations') {
+      await loadOperations();
+    } else if (action === 'queue-job') {
+      const result = await api('/api/v1/jobs', {
+        method: 'POST',
+        body: JSON.stringify({ job_type: target.dataset.jobType, payload: {} }),
+      });
+      toast(`Queued job #${result.job_id} — run the worker to execute it`);
+      await loadOperations();
+    } else if (action === 'retry-job') {
+      await api(`/api/v1/jobs/${target.dataset.job}/retry`, { method: 'POST', body: '{}' });
+      toast('Job queued for retry');
+      await loadOperations();
     } else if (action === 'export-csv') {
       await exportCsv();
     } else if (action === 'apply-policies') {
@@ -1811,7 +1875,7 @@ document.addEventListener('click', async (event) => {
       await loadNotifications();
     } else if (action === 'sweep-notifications') {
       const result = await api('/api/v1/notifications/sweep', { method: 'POST', body: '{}' });
-      toast(`Queued: ${result.due_soon} due soon, ${result.overdue} overdue, ${result.recertification} recertification`);
+      toast(`Queued sweep job #${result.job_id} — run the worker to execute it`);
       await loadNotifications();
     } else if (action === 'analyze-import') {
       await analyzeImport();
@@ -2153,13 +2217,17 @@ $('#actor').addEventListener('change', () => {
     const health = await api('/api/v1/health');
     const meta = await api('/api/v1/meta');
     $('#version').textContent = 'v' + health.version;
+    state.authMode = meta.auth_mode || 'demo';
+    applyPermissions();
     const attributeSelect = $('#policyDialog form [name=attribute]');
     if (attributeSelect && meta.policy_attributes) {
       attributeSelect.innerHTML = meta.policy_attributes.map((name) =>
         `<option>${esc(name)}</option>`).join('');
     }
-    $('#role').value = 'platform_admin';
-    $('#actor').value = ROLE_DEFAULTS.platform_admin;
+    if (state.authMode !== 'proxy') {
+      $('#role').value = 'platform_admin';
+      $('#actor').value = ROLE_DEFAULTS.platform_admin;
+    }
     if (!location.hash) history.replaceState(null, '', '#/dashboard');
     lastRouteHash = location.hash;
     await refreshSession({ reload: false });

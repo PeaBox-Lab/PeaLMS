@@ -1,4 +1,4 @@
-# PeaLMS v0.4.0
+# PeaLMS v0.5.0
 
 A dependency-free corporate learning management system that is deliberately
 Moodle-like in capability and stricter than Moodle by construction: one SQLite
@@ -6,9 +6,10 @@ file, no runtime packages, no inline scripts or styles, no outbound network, and
 a single auditable codebase.
 
 v0.2.0 established enterprise controls. v0.3.0 added real learning content.
-v0.4.0 adds the engagement layer that makes the product feel like an LMS rather
-than a compliance spreadsheet: cohorts, learning paths, gradebook, verifiable
-badges and certificates, and course discussions.
+v0.4.0 added the engagement layer: cohorts, learning paths, gradebook,
+verifiable credentials and discussions. v0.5.0 adds the enterprise pilot
+foundation: signed proxy identity, a durable job worker, SMTP delivery with a
+dead-letter trail, and an operations view.
 
 ## What works
 
@@ -63,7 +64,7 @@ badges and certificates, and course discussions.
   policy reassessment.
 
 ### Platform
-- Versioned schema migrations through v5, including adoption of v0.1.0
+- Versioned schema migrations through v6, including adoption of v0.1.0
   databases.
 - HMAC session tokens bound to browser fingerprint, with revocation and
   server-side epoch rotation.
@@ -76,6 +77,17 @@ badges and certificates, and course discussions.
   limits and structured JSON access logs.
 - Responsive, keyboard-operable interface with no inline handlers or styles.
 - Zero third-party runtime dependencies.
+
+### Enterprise pilot foundation (v0.5.0)
+- Signed reverse-proxy identity assertions with trusted-proxy allowlists,
+  clock-skew checks, replay nonces and server-side group-to-role mapping. No
+  endpoint accepts a client-supplied role.
+- Durable job ledger with atomic claims, bounded retries, backoff, job events and
+  manual retry of failed jobs.
+- Optional SMTP transport for the notification outbox; delivery attempts are
+  recorded and failures dead-letter after a bounded retry budget.
+- Operations view for job and delivery evidence, plus a worker CLI for cron or a
+  long-running process.
 
 ## Quick start
 
@@ -106,8 +118,10 @@ LMS_DEMO_MODE=true corporate-lms
 
 ```bash
 python -m lms.server --migrate-only          # apply migrations and exit
-python -m lms.server --sweep-notifications   # queue due/overdue/recert messages
+python -m lms.server --sweep-notifications   # run sweeps immediately (legacy)
 python -m lms.server --no-seed               # start without sample data
+python -m lms.worker --once                  # drain one batch of durable jobs
+python -m lms.worker --poll-seconds 30       # long-running worker
 ```
 
 ## Configuration
@@ -126,6 +140,21 @@ python -m lms.server --no-seed               # start without sample data
 | `LMS_MAX_BODY_BYTES` | `5000000` | JSON request body limit |
 | `LMS_MAX_UPLOAD_BYTES` | `200000000` | Media upload limit |
 | `LMS_RATE_LIMIT_PER_MINUTE` | `240` | Per client/identity limit; `0` disables |
+| `LMS_AUTH_MODE` | `demo` | `demo`, `proxy` or `hybrid` identity mode |
+| `LMS_PROXY_SECRET` | empty | Shared HMAC secret for signed proxy assertions |
+| `LMS_PROXY_IDENTITY_HEADER` | `X-LMS-Identity` | Header carrying the signed assertion |
+| `LMS_TRUSTED_PROXIES` | loopback CIDRs | Comma-separated proxy networks allowed to assert identity |
+| `LMS_PROXY_ROLE_GROUPS` | empty | `group=role,...` server-side group map |
+| `LMS_PROXY_DEFAULT_ROLE` | `learner` | Role when no group maps to a role |
+| `LMS_PROXY_CLOCK_SKEW_SECONDS` | `300` | Allowed assertion clock skew |
+| `LMS_PROXY_NONCE_TTL_SECONDS` | `300` | Replay cache lifetime |
+| `LMS_SMTP_HOST` | empty | SMTP host; enables email delivery with `LMS_SMTP_FROM` |
+| `LMS_SMTP_PORT` | `25` | SMTP port |
+| `LMS_SMTP_STARTTLS` | `false` | Issue STARTTLS before authentication |
+| `LMS_SMTP_USERNAME` / `LMS_SMTP_PASSWORD` | empty | SMTP credentials |
+| `LMS_SMTP_FROM` | empty | From address for notifications |
+| `LMS_SMTP_TIMEOUT_SECONDS` | `10` | SMTP connection timeout |
+| `LMS_SMTP_MAX_ATTEMPTS` | `3` | Delivery attempts before dead-letter |
 | `LMS_LOG_LEVEL` | `INFO` | Log level |
 | `LMS_SEED_ON_START` | `true` | Seed sample data on an empty database |
 
@@ -136,6 +165,16 @@ short-lived HMAC-signed sessions for the selected identity and binds them to the
 browser's user agent. Direct role headers are not trusted. Production must set
 `LMS_DEMO_MODE=false`, integrate an OIDC/SAML identity provider, and derive
 authorization from trusted server-side claims.
+
+For a pilot, set `LMS_AUTH_MODE=proxy` and let an authenticating reverse proxy
+sign `X-LMS-Identity` assertions. The assertion carries `sub`, `groups`, `iat`,
+`exp` and a unique `nonce`; PeaLMS verifies the HMAC, freshness, replay state and
+source network, then maps groups to roles with `LMS_PROXY_ROLE_GROUPS`. A role
+field in the assertion is ignored. Example group map:
+
+```text
+LMS_PROXY_ROLE_GROUPS=admins=learning_admin,trainers=instructor,managers=manager
+```
 
 | Role | User | What to look at |
 |---|---|---|
@@ -192,6 +231,12 @@ POST   /api/v1/assignments/reassign
 GET    /api/v1/team
 GET    /api/v1/notifications?unread_only=
 POST   /api/v1/notifications/{id}/read
+POST   /api/v1/notifications/sweep
+GET    /api/v1/jobs
+POST   /api/v1/jobs
+GET    /api/v1/jobs/{id}
+POST   /api/v1/jobs/{id}/retry
+GET    /api/v1/outbox
 GET    /api/v1/reports/compliance.csv
 GET    /api/v1/audit?event_type=&actor=&limit=&offset=
 POST   /api/v1/hris/analyze
@@ -217,10 +262,10 @@ causing a mass suspension.
 python -m unittest discover -s tests -v
 ```
 
-The 112 tests cover migrations, organization scoping, the assignment lifecycle,
+The 138 tests cover migrations, organization scoping, the assignment lifecycle,
 content and quizzes, cohorts, paths, gradebook, credentials, discussions,
-notifications, reporting, API permissions, session revocation, media validation
-and the HTTP transport.
+notifications, reporting, API permissions, session revocation, media validation,
+the HTTP transport, proxy identity, durable jobs and outbox delivery.
 
 ## Project layout
 
@@ -236,6 +281,10 @@ and the HTTP transport.
 - `lms/engagement.py` — cohorts, paths, gradebook, credentials and discussions.
 - `lms/media.py` — streaming uploads, validation and signed URLs.
 - `lms/notifications.py` — templates, outbox, inbox and delivery.
+- `lms/identity.py` — signed proxy identity and server-side role mapping.
+- `lms/jobs.py` — durable job ledger, claims, retries and worker dispatch.
+- `lms/worker.py` — CLI entry point for scheduled job processing.
+- `lms/email.py` — optional SMTP transport for the notification outbox.
 - `lms/reports.py` — compliance export.
 - `lms/hris.py` — HRIS validation, diff and guarded application.
 - `lms/security.py` — rate limiter, headers and structured logging.

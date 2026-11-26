@@ -12,7 +12,9 @@ import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 
-VERSION = "0.4.0"
+from .permissions import ROLE_PERMISSIONS
+
+VERSION = "0.5.0"
 PACKAGE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_ROOT.parent
 STATIC_DIR = PACKAGE_ROOT / "static"
@@ -52,6 +54,31 @@ def _int(env: dict, name: str, default: int, minimum: int | None = None,
     return value
 
 
+def _csv(env: dict, name: str, default: str = "") -> tuple[str, ...]:
+    return tuple(
+        item.strip() for item in _env(env, name, default).split(",") if item.strip()
+    )
+
+
+def _role_map(env: dict, name: str) -> dict[str, str]:
+    """Parse ``group=role,group=role`` without accepting unknown role names."""
+    result: dict[str, str] = {}
+    raw = _env(env, name, "")
+    if not raw:
+        return result
+    for part in raw.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"{name} entries must use group=role, got {item!r}")
+        group, role = (piece.strip() for piece in item.split("=", 1))
+        if not group or role not in ROLE_PERMISSIONS:
+            raise ValueError(f"{name} maps groups to known roles, got {item!r}")
+        result[group] = role
+    return result
+
+
 @dataclass(frozen=True)
 class Settings:
     version: str = VERSION
@@ -70,10 +97,30 @@ class Settings:
     log_level: str = "INFO"
     seed_on_start: bool = True
     static_dir: Path = STATIC_DIR
+    auth_mode: str = "demo"
+    proxy_secret: str = ""
+    proxy_header: str = "X-LMS-Identity"
+    proxy_trusted_proxies: tuple[str, ...] = ("127.0.0.1/32", "::1/128")
+    proxy_role_groups: dict[str, str] = field(default_factory=dict)
+    proxy_default_role: str = "learner"
+    proxy_clock_skew_seconds: int = 300
+    proxy_nonce_ttl_seconds: int = 300
+    smtp_host: str = ""
+    smtp_port: int = 25
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_starttls: bool = False
+    smtp_timeout_seconds: int = 10
+    smtp_max_attempts: int = 3
 
     @property
     def is_loopback(self) -> bool:
         return self.host in ("127.0.0.1", "localhost", "::1")
+
+    @property
+    def smtp_enabled(self) -> bool:
+        return bool(self.smtp_host and self.smtp_from)
 
     def validate_binding(self) -> None:
         if self.demo_mode and not self.is_loopback and not self.allow_remote_demo:
@@ -81,6 +128,12 @@ class Settings:
                 "Demo mode may bind only to loopback unless "
                 "LMS_ALLOW_REMOTE_DEMO=true is explicitly set"
             )
+        if self.auth_mode in ("proxy", "hybrid") and not self.proxy_secret:
+            raise ValueError(
+                "Proxy authentication requires LMS_PROXY_SECRET; no client-supplied "
+                "role is ever trusted"
+            )
+
 
 
 def load_settings(env: dict | None = None) -> Settings:
@@ -99,6 +152,12 @@ def load_settings(env: dict | None = None) -> Settings:
     log_level = _env(env, "LMS_LOG_LEVEL", "INFO").upper()
     if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         raise ValueError(f"LMS_LOG_LEVEL must be a standard level, got {log_level!r}")
+    auth_mode = _env(env, "LMS_AUTH_MODE", "demo").strip().lower()
+    if auth_mode not in {"demo", "proxy", "hybrid"}:
+        raise ValueError(f"LMS_AUTH_MODE must be demo, proxy or hybrid, got {auth_mode!r}")
+    proxy_default_role = _env(env, "LMS_PROXY_DEFAULT_ROLE", "learner")
+    if proxy_default_role not in ROLE_PERMISSIONS:
+        raise ValueError(f"LMS_PROXY_DEFAULT_ROLE must be a known role, got {proxy_default_role!r}")
     settings = Settings(
         host=_env(env, "LMS_HOST", "127.0.0.1"),
         port=_int(env, "LMS_PORT", 8080, minimum=1, maximum=65535),
@@ -115,6 +174,32 @@ def load_settings(env: dict | None = None) -> Settings:
         log_level=log_level,
         seed_on_start=_bool(env, "LMS_SEED_ON_START", True),
         static_dir=STATIC_DIR,
+        auth_mode=auth_mode,
+        proxy_secret=_env(env, "LMS_PROXY_SECRET", ""),
+        proxy_header=_env(env, "LMS_PROXY_IDENTITY_HEADER", "X-LMS-Identity"),
+        proxy_trusted_proxies=_csv(
+            env, "LMS_TRUSTED_PROXIES", "127.0.0.1/32,::1/128"
+        ),
+        proxy_role_groups=_role_map(env, "LMS_PROXY_ROLE_GROUPS"),
+        proxy_default_role=proxy_default_role,
+        proxy_clock_skew_seconds=_int(
+            env, "LMS_PROXY_CLOCK_SKEW_SECONDS", 300, minimum=0, maximum=3600
+        ),
+        proxy_nonce_ttl_seconds=_int(
+            env, "LMS_PROXY_NONCE_TTL_SECONDS", 300, minimum=30, maximum=86400
+        ),
+        smtp_host=_env(env, "LMS_SMTP_HOST", ""),
+        smtp_port=_int(env, "LMS_SMTP_PORT", 25, minimum=1, maximum=65535),
+        smtp_username=_env(env, "LMS_SMTP_USERNAME", ""),
+        smtp_password=_env(env, "LMS_SMTP_PASSWORD", ""),
+        smtp_from=_env(env, "LMS_SMTP_FROM", ""),
+        smtp_starttls=_bool(env, "LMS_SMTP_STARTTLS", False),
+        smtp_timeout_seconds=_int(
+            env, "LMS_SMTP_TIMEOUT_SECONDS", 10, minimum=1, maximum=120
+        ),
+        smtp_max_attempts=_int(
+            env, "LMS_SMTP_MAX_ATTEMPTS", 3, minimum=1, maximum=10
+        ),
     )
     settings.validate_binding()
     return settings

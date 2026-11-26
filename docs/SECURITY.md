@@ -13,6 +13,11 @@
   invalidates all tokens.
 - Demo sessions are restricted to loopback clients and are disabled in the
   shipped Docker stack; demo impersonation is never a production identity.
+- Proxy mode accepts only short HMAC-signed assertions from configured trusted
+  proxy networks. Assertions must carry a known subject, fresh `iat`/`exp` within
+  the configured skew and a replay nonce; roles are derived from a server-side
+  group map. A `role` or `groups` field supplied by a browser is never trusted,
+  and demo impersonation controls are hidden in proxy mode.
 - Learner completion is bound to the signed employee identity; privileged
   completion requires a server-validated role. Learners cannot self-report
   scores or skip required lessons.
@@ -42,6 +47,10 @@
   codes are unguessable and resolve to a signed award record without exposing
   the recipient's work email.
 - Discussion posting requires course access; moderators alone may delete threads.
+- Durable jobs are claimed atomically, retry with backoff and retain terminal
+  failures with event history. Notification delivery attempts are recorded
+  separately; after the retry budget the notification is dead-lettered but the
+  in-app record is preserved.
 
 ### Transport and browser
 - Strict Content Security Policy: `default-src 'self'`, `script-src 'self'`,
@@ -58,8 +67,10 @@
   for the declared lesson duration (at least fifteen minutes) and refreshed by
   the client before expiry. Byte ranges are validated, and unsatisfiable ranges
   return 416 rather than leaking partial content.
-- Per-client/identity sliding-window rate limiting; static-path traversal
-  protection; request ids and structured JSON access logs.
+- Per-client/identity sliding-window rate limiting, including proxy identities;
+  static-path traversal protection; request ids and structured JSON access logs.
+- `/api/v1/meta` exposes the active identity and transport mode so the client can
+  avoid presenting demo-only controls in federated deployments.
 - HTML escaping before displaying returned values; CSV exports neutralise
   formula-injection prefixes.
 - Session switches cancel in-flight view and import work so stale identities
@@ -71,8 +82,8 @@
 ## Required before production
 
 ### Identity
-- Replace demo sessions with OIDC/SAML authentication and trusted server-side
-  role and scope claims.
+- Replace the signed-header pilot with a full OIDC/SAML relying party: provider
+  discovery, key rotation, logout, MFA and trusted server-side scope claims.
 - If cookies replace bearer tokens: secure, HttpOnly, SameSite cookies plus CSRF
   tokens and origin checks.
 - Privileged-access review, MFA, break-glass procedures and IdP-driven session
@@ -81,8 +92,12 @@
 ### Platform
 - HTTPS-only operation with a managed certificate and strict transport policy.
 - Move rate limiting to a shared store or the edge gateway.
-- Move secrets into a managed secrets platform; never ship a fixed
-  `LMS_SESSION_SECRET`.
+- Move job coordination to a shared queue with lease fencing; keep SQLite as a
+  single-writer local store only.
+- Move secrets (`LMS_SESSION_SECRET`, `LMS_PROXY_SECRET`, SMTP credentials) into a
+  managed secrets platform; never ship fixed secrets.
+- Use TLS to the SMTP relay; STARTTLS is configurable but must be verified for the
+  chosen provider.
 - Encrypt databases, backups, employee extracts and object storage.
 - Malware scanning and sandboxing before accepting uploaded learning packages.
 - Immutable, centralized logging with retention and alerting.

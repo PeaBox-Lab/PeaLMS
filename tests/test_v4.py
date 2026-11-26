@@ -55,8 +55,8 @@ class IsolatedEngagementDb(unittest.TestCase):
 
 
 class SchemaAndSeedTests(IsolatedEngagementDb):
-    def test_schema_version_is_five(self):
-        self.assertEqual(schema_version(), 5)
+    def test_schema_version_is_six(self):
+        self.assertEqual(schema_version(), 6)
 
     def test_engagement_seed_data_exists(self):
         self.assertTrue(engagement.list_cohorts())

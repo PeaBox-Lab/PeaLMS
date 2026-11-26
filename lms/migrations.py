@@ -485,6 +485,63 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX IF NOT EXISTS idx_session_revocations_actor ON session_revocations(actor)",
         ),
     ),
+    Migration(
+        6,
+        "worker_and_outbox",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              job_type TEXT NOT NULL,
+              payload_json TEXT NOT NULL DEFAULT '{}',
+              status TEXT NOT NULL DEFAULT 'queued',
+              attempts INTEGER NOT NULL DEFAULT 0,
+              max_attempts INTEGER NOT NULL DEFAULT 3,
+              run_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              locked_at TEXT,
+              locked_by TEXT,
+              last_error TEXT,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              completed_at TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS job_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              job_id INTEGER NOT NULL,
+              event TEXT NOT NULL,
+              detail TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS notification_deliveries (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              notification_id INTEGER NOT NULL,
+              channel TEXT NOT NULL,
+              transport TEXT NOT NULL,
+              status TEXT NOT NULL,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              last_error TEXT,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY(notification_id) REFERENCES notifications(id) ON DELETE CASCADE
+            )
+            """,
+            "ALTER TABLE notifications ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE notifications ADD COLUMN last_error TEXT",
+            "ALTER TABLE notifications ADD COLUMN next_attempt_at TEXT",
+            "ALTER TABLE notifications ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status_run_at ON jobs(status, run_at)",
+            "CREATE INDEX IF NOT EXISTS idx_job_events_job ON job_events(job_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_deliveries_notification "
+            "ON notification_deliveries(notification_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_notifications_delivery "
+            "ON notifications(status, next_attempt_at)",
+        ),
+    ),
 )
 
 SCHEMA_VERSION = max(m.version for m in MIGRATIONS)

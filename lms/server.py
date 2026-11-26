@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import api, media
+from . import api, identity as proxy_identity, media
 from .auth import issue_token as issue_demo_token
 from .auth import verify_token
 from .config import get_settings
@@ -87,6 +87,14 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- request helpers --------------------------------------------------
     def _identity(self):
+        settings = get_settings()
+        verified = proxy_identity.from_headers(
+            self.headers, remote=self.client_address[0]
+        )
+        if verified:
+            return verified
+        if settings.auth_mode == "proxy":
+            return None
         header = self.headers.get("Authorization", "")
         if header.startswith("Bearer "):
             return verify_token(
@@ -250,7 +258,7 @@ class Handler(BaseHTTPRequestHandler):
         status = 500
         actor = None
         fingerprint = self.headers.get("User-Agent", "")
-        identity = self._identity() if self.headers.get("Authorization") else None
+        identity = self._identity()
         actor = (identity or {}).get("actor")
 
         limiter: RateLimiter = self.server.rate_limiter

@@ -13,7 +13,7 @@ changelog, release notes, security guidance and this document.
   third*. A capability that protects people data or makes compliance evidence
   trustworthy outranks a feature that only looks good in a demo.
 
-## Current state — v0.4.0
+## Current state — v0.5.0
 
 - Enterprise controls from v0.2.0: migrations, manager scoping, assignment
   lifecycle, certification cycles, notifications, reporting and HRIS import.
@@ -21,11 +21,13 @@ changelog, release notes, security guidance and this document.
   links, quizzes, attempts and automatic completion.
 - Engagement from v0.4.0: cohorts, learning paths, gradebook, verifiable badges
   and certificates, course discussions and role-native views.
+- Pilot foundation from v0.5.0: signed proxy identity, durable job ledger and
+  worker, SMTP outbox delivery with dead-letter evidence and an operations view.
 - Session revocation, fingerprint binding, loopback-only demo sessions,
   streaming media validation and RFC-correct media ranges.
 - Strict CSP with no inline handlers or styles and no third-party runtime
   dependencies.
-- 112 automated tests.
+- 138 automated tests.
 
 ## Market study — what we copy and what we refuse
 
@@ -69,13 +71,28 @@ Udemy using 2026 sources.
 10. **Simple roles and tenant isolation with CSS-only branding.** No plugin
     architecture required to customise the experience.
 
-## v0.5.0 — Enterprise identity and scale (next)
+## v0.5.0 — Enterprise identity and scale (shipped pilot slice)
 
 Goal: make v0.4.0 safe to pilot with real people data and multiple teams.
 
-- **OIDC/SAML pilot integration.** Replace demo sessions behind a feature flag;
-  map provider groups to roles; keep server-side scope derivation. Acceptance:
-  no endpoint accepts a client-supplied role.
+### Shipped in v0.5.0
+
+- **Signed proxy identity pilot.** An authenticating reverse proxy can assert a
+  short HMAC-signed identity. PeaLMS verifies trusted source networks, freshness,
+  replay nonces and a server-side group-to-role map. No endpoint accepts a
+  client-supplied role; demo impersonation controls are hidden in proxy mode.
+- **Scheduled worker.** Durable job ledger with atomic claims, bounded retries,
+  backoff, event history and manual retry of failed jobs. `python -m lms.worker`
+  supports cron or a long-running process.
+- **SMTP outbox delivery.** Optional SMTP mirror with per-attempt evidence and
+  dead-lettering after the retry budget. The in-app inbox remains authoritative.
+- **Operations evidence.** Admins and auditors can inspect jobs, retries, job
+  events and delivery attempts from one view.
+
+### Carried forward to later increments
+
+- **Full OIDC/SAML relying party.** Provider discovery, key rotation, logout and
+  MFA remain the identity provider's responsibility in this signed-header pilot.
 - **Cookie/session hardening** if browser sessions replace bearer tokens:
   secure, HttpOnly, SameSite cookies, CSRF tokens, origin checks and refresh
   rotation.
@@ -86,10 +103,6 @@ Goal: make v0.4.0 safe to pilot with real people data and multiple teams.
 - **Delegated administration.** Scoped admin roles per business unit, department
   or manager subtree with an explicit grant/revoke audit trail.
 - **Shared rate limiting and quotas** for multi-replica deployments.
-- **Scheduled worker entry point.** Durable job ledger for import pickup,
-  notification sweeps, recertification and outbox delivery.
-- **SMTP transport** with retry and dead-letter handling; in-app inbox remains
-  the source of truth.
 - **Accessibility regression pass.** Automated checks plus a manual keyboard and
   screen-reader checklist for every view.
 
@@ -144,7 +157,8 @@ AI is optional, human-reviewed and gated on data governance.
 
 ## Sequencing and dependencies
 
-1. Identity and transport hardening (v0.5.0) must precede real employee data.
+1. Identity and transport hardening (v0.5.0 pilot slice, then the full federated
+   relying party) must precede real employee data.
 2. Tenant context must land before delegated administration and cross-entity
    reporting.
 3. Content packages and access controls precede offline sync and SCORM.

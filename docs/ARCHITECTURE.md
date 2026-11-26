@@ -2,16 +2,18 @@
 
 ## Release architecture
 
-v0.4.0 remains deliberately dependency-light: a Python standard-library HTTP
+v0.5.0 remains deliberately dependency-light: a Python standard-library HTTP
 service, SQLite transactional store, and a static HTML/CSS/JavaScript client.
-Configuration, transport, routing, content, engagement, media, notifications and
-reporting have explicit boundaries, and the schema is versioned through v5.
+Configuration, identity, transport, routing, content, engagement, media,
+notifications, jobs and reporting have explicit boundaries, and the schema is
+versioned through v6.
 
 ```
-browser (CSP-safe vanilla JS)
-        │  JSON over HTTP, bearer session
-        ▼
-lms/server.py        transport: parsing, rate limit, headers, request ids
+browser (CSP-safe vanilla JS)     trusted proxy (OIDC/SAML terminator)
+        │  JSON over HTTP, bearer session    │  signed X-LMS-Identity assertion
+        └──────────────┬─────────────────────┘
+                       ▼
+lms/server.py        transport: parsing, identity, rate limit, headers, request ids
         │
         ▼
 lms/api.py           versioned routes, permission checks, error mapping
@@ -22,16 +24,22 @@ lms/api.py           versioned routes, permission checks, error mapping
         ├── lms/media.py         streaming uploads, validation, signed URLs
         ├── lms/hris.py          import validation, diff, guarded application
         ├── lms/notifications.py outbox, templates, inbox, delivery
+        ├── lms/jobs.py          durable job ledger, claims, retries, events
+        ├── lms/email.py         optional SMTP transport
         └── lms/reports.py       compliance export
         │
         ▼
 lms/db.py  →  SQLite  ←  lms/migrations.py
+        ▲
+lms/worker.py        out-of-process job runner (cron or long-running)
 ```
 
 Cross-cutting modules:
 
 - `lms/config.py` — one validated `Settings` object, lazily cached.
 - `lms/auth.py` — fingerprint-bound HMAC tokens with revocation and epoch rotation.
+- `lms/identity.py` — signed proxy assertions, trusted networks, replay cache and
+  server-side group-to-role mapping.
 - `lms/permissions.py` — role → permission catalogue.
 - `lms/security.py` — rate limiter, security headers, structured access logs.
 - `lms/audit.py` — transactional audit event writer.
@@ -39,8 +47,10 @@ Cross-cutting modules:
 
 ## Request lifecycle
 
-1. `server.Handler` assigns a request id and resolves the bearer token to an
-   identity, including fingerprint and revocation checks.
+1. `server.Handler` assigns a request id and resolves either a signed proxy
+   assertion or a bearer token to an identity. Proxy assertions are checked for
+   source network, HMAC, freshness and replay; bearer tokens are checked for
+   fingerprint, revocation and epoch. In `proxy` mode bearer sessions are ignored.
 2. It applies a rate limit keyed by client address and identity. Media uploads
    stream to a spooled temporary file instead of being buffered in memory.
 3. `api.handle` normalises `/api` to `/api/v1`, matches a route, and dispatches.
@@ -69,7 +79,9 @@ Core entities:
   grouping and sequencing.
 - `badges`, `badge_awards` — criteria and verifiable credentials.
 - `discussions`, `discussion_posts` — threaded course conversations.
-- `notifications` — durable outbox and inbox.
+- `notifications` — durable outbox and inbox, with retry and dead-letter metadata.
+- `notification_deliveries` — per-attempt transport evidence.
+- `jobs`, `job_events` — durable work ledger, claims, retries and history.
 - `import_jobs` — checksum, counts and reconciliation summary.
 - `audit_events` — append-only event history.
 - `session_revocations`, `app_state` — token revocation and session epoch.
@@ -151,6 +163,15 @@ separate step (`deliver`) so a transport failure cannot roll back a business
 operation. Sweeps deduplicate per assignment cycle by checking
 `(template, entity_id)`.
 
+From v0.5.0, sweeps enqueue a durable job instead of running inline. `jobs.claim`
+uses `BEGIN IMMEDIATE` so several workers can share a single-writer SQLite
+database. Failures requeue with exponential backoff; terminal failures remain as
+`failed` jobs with events. Outbox delivery uses SMTP when configured, otherwise a
+structured log transport. Each attempt is recorded in `notification_deliveries`;
+after `LMS_SMTP_MAX_ATTEMPTS` the notification is marked `dead` while the in-app
+record is retained. The operations view reads this evidence without exposing
+secrets or recipient email addresses.
+
 ## Security posture
 
 - Strict CSP (`script-src 'self'`, `style-src 'self'`, `media-src 'self'`, narrow
@@ -160,8 +181,10 @@ operation. Sweeps deduplicate per assignment cycle by checking
 - `X-Frame-Options: DENY`, `nosniff`, no-referrer, restrictive permissions
   policy, and HSTS when TLS is terminated upstream.
 - Fingerprint-bound bearer tokens in the `Authorization` header, with revocation
-  and epoch rotation. Browser requests are not ambient credentials, so classic
-  CSRF does not apply; cookies would require CSRF tokens.
+  and epoch rotation. In federated pilots, a trusted proxy supplies a signed
+  assertion instead; client-supplied role headers are always ignored. Browser
+  requests are not ambient credentials, so classic CSRF does not apply; cookies
+  would require CSRF tokens.
 - Parameterized SQL, foreign keys enabled, transaction rollback on error.
 - Streaming uploads with MIME/magic-byte validation; short-lived signed media
   URLs with lesson-aware lifetimes, client refresh and safe range semantics.
@@ -178,10 +201,10 @@ See `docs/SECURITY.md` for the remaining production requirements.
 | Python built-in server | Supported application framework behind an API gateway |
 | SQLite | PostgreSQL with high availability and point-in-time recovery |
 | In-process rate limiter | Shared limiter (Redis or gateway) |
-| Demo bearer sessions | OIDC/SAML federation with server-side claims |
+| Demo bearer sessions or signed proxy pilot | Full OIDC/SAML relying party with server-side claims |
 | Synchronous assignment updates | Workflow orchestration and asynchronous workers |
-| In-process sweeps | Scheduled worker with a job ledger |
-| Log-only notification transport | SMTP/chat transport with retry and dead letters |
+| SQLite job ledger and CLI worker | Shared queue with lease fencing and horizontal workers |
+| SMTP mirror or log fallback | Managed email/chat transport with governed templates |
 | Basic table lookup | Permission-aware search service |
 | Operational SQL metrics | Governed analytics store and semantic metrics layer |
 | Local execution | Containers, Kubernetes, GitOps, secrets management, autoscaling |
@@ -208,10 +231,10 @@ warnings or row errors respectively.
 
 ## Next architectural increments
 
-1. Federated identity and shared session/rate-limit infrastructure for pilots.
+1. Full federated identity, cookie hardening and shared rate-limit infrastructure.
 2. PostgreSQL repositories and tenant context on every query.
-3. Scheduled worker entry point with a durable job ledger.
-4. Declarative course packages and offline signed sync.
-5. Transactional outbox to an event bus and signed webhooks.
+3. Delegated administration with scoped grants and cross-tenant access tests.
+4. Transactional outbox to an event bus and signed webhooks.
+5. Declarative course packages and offline signed sync.
 6. Permission-aware search and governed analytics.
 7. Formal SLOs, backups, restore exercises and disaster recovery.

@@ -49,6 +49,7 @@ header strong { font-size: 18px; }
 header small { color: #cbd5e1; }
 
 .session { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.session-controls { display: contents; }
 .session label { font-size: 12px; color: #cbd5e1; }
 .session select, .session input {
   height: 34px; border: 1px solid #7790ad; border-radius: 6px;

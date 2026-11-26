@@ -2,6 +2,37 @@
 
 All notable product changes are documented here.
 
+## 0.5.0 — 2026-11-26
+
+### Added
+
+- Signed reverse-proxy identity mode with trusted-proxy CIDRs, freshness and
+  replay checks, and server-side group-to-role mapping. Client-supplied roles
+  are never accepted.
+- Schema migration 6: durable jobs, job events and notification delivery
+  attempts, with retry metadata on the outbox.
+- Durable job ledger with atomic claims, bounded retries, backoff and manual
+  retry of failed jobs.
+- `python -m lms.worker` entry point for cron or a long-running worker.
+- Optional SMTP transport with a structured log fallback and a dead-letter trail
+  for delivery failures.
+- Operations view and API endpoints for job and delivery evidence.
+- `auth_mode`, `demo_mode` and `smtp_enabled` in `/api/v1/meta` so the browser
+  hides demo impersonation controls under federated identity.
+
+### Changed
+
+- Notification sweeps queue a durable job instead of running inline from the UI.
+- Outbox delivery records every attempt and stops after a bounded retry budget;
+  the in-app inbox remains the source of truth.
+- The static version marker now matches the released version.
+- The roadmap splits identity scale work into a following pilot increment.
+
+### Tests
+
+- 138 automated tests, including 26 v0.5 identity, worker, outbox and operations
+  tests.
+
 ## 0.4.0 — 2026-11-26
 
 ### Added
